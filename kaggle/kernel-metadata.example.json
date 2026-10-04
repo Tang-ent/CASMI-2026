@@ -1,0 +1,15 @@
+{
+  "id": "<kaggle-user>/casmi26-kXX-name",
+  "title": "casmi26-kXX-name",
+  "code_file": "casmi26-kXX-name.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "competition_sources": ["enveda-CASMI26-molecule-id-mass-spectra"],
+  "kernel_sources": [],
+  "model_sources": []
+}
