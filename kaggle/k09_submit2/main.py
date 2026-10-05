@@ -2,6 +2,8 @@
 # # casmi26-k09-submit2
 # クラス2対応版の提出用ノートブック（インターネット無効）。
 # k01 のキャッシュ、k05 の候補プール（train ∪ COCONUT）、k08 が選んだスコアで、分子ごとに最大25件を出力する。
+# v2（M2）: k06 の指紋予測モデルで f·z の特徴量も計算する（CPU で推論）。スペクトルには CE と装置の情報も渡す。
+# v3（M2.1）: variant に tau があれば、lib_grp_max ≥ tau の分子は lib_analog、それ以外はランカーで順位を付ける。
 
 # %%
 import json
@@ -11,14 +13,15 @@ import time
 import numpy as np
 import pandas as pd
 
-from casmi26 import cache, chem, paths, pool, search, spectra
+from casmi26 import cache, chem, fpnet, harness, paths, pool, search
 
 T0 = time.time()
 VARIANT = None  # None = ranker.json の既定
 
+MODEL = fpnet.load_checked()  # k06 の重み（データセット casmi26-fpnet。エポック 10 未満なら止める）
 C = cache.Cache(cache.Cache.find_dir())
 P = pool.Pool(pool.Pool.find_dir())
-S = search.Searcher(C, P)
+S = search.Searcher(C, P, model=MODEL)
 RK_DIR = os.path.dirname(paths.find("ranker.json"))
 rk = json.load(open(f"{RK_DIR}/ranker.json"))
 VARIANT = VARIANT or rk["default"]
@@ -30,7 +33,9 @@ else:
     v = rk["variants"][VARIANT]
     models = [lgb.Booster(model_file=f"{RK_DIR}/{fn}") for fn in v["files"]]
     fidx = [search.COL[c] for c in v["features"]]
-    score_fn = lambda X: np.mean([m.predict(X[:, fidx]) for m in models], axis=0)
+    rk_fn = lambda X: np.mean([m.predict(X[:, fidx]) for m in models], axis=0)
+    score_fn = (lambda X: search.hybrid_score(X, v["tau"], rk_fn(X))) if "tau" in v else rk_fn
+    print("variant:", {k: x for k, x in v.items() if k != "features"})
 print("score:", VARIANT)
 
 COMP = paths.comp_dir()
@@ -42,11 +47,7 @@ print(f"test: {len(te):,} spectra / {te.molecule_id.nunique():,} molecules")
 DEFAULT_ADDUCT = {1: "[M+H]+", -1: "[M-H]-"}
 rows, stats = [], dict(ranked=0, no_candidates=0, no_mass=0, padded=0, top1_in_train=0)
 for i, (mid, g) in enumerate(te.groupby("molecule_id", sort=False)):
-    specs = []
-    for r in g.itertuples():
-        mz, it = spectra.clean_one(r.ms2_mzs, r.ms2_normalized_intensities, r.precursor_mz)
-        specs.append(dict(mz=mz, it=it, prec=float(r.precursor_mz), adduct=str(r.adduct),
-                          mode=1 if r.ionization_mode == "positive" else -1))
+    specs = harness.test_specs(g)
     cand, X, info = S.features(specs)
     order = []
     if len(cand):

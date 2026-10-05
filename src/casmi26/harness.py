@@ -132,12 +132,29 @@ def query_specs(C, rows):
                  mode=int(C.mode[r]), ce=float(C.ce[r]), tims=float(C.lib[r] in tims)) for r in rows]
 
 
+def test_specs(g):
+    """Spectra dicts of one molecule of the competition test table (rows of one molecule_id), with the same
+    conditioning as query_specs: ce = mean of collision_energy_ev (NaN when missing), tims = timsTOF instrument."""
+    from . import spectra
+    out = []
+    for r in g.itertuples():
+        mz, it = spectra.clean_one(r.ms2_mzs, r.ms2_normalized_intensities, r.precursor_mz)
+        ce = getattr(r, "collision_energy_ev", None)
+        ce = np.asarray(ce if ce is not None else [], float).ravel()
+        ce = float(np.nanmean(ce)) if np.isfinite(ce).any() else np.nan
+        out.append(dict(mz=mz, it=it, prec=float(r.precursor_mz), adduct=str(r.adduct),
+                        mode=1 if r.ionization_mode == "positive" else -1, ce=ce,
+                        tims=float(getattr(r, "instrument_type", "") == "timsTOF")))
+    return out
+
+
 TRAIN_SETS = ("R1", "R2")
 
 
 def run_queries(searcher, queries, log=print, max_cand_train=300, keep_rule=None):
     """Feature rows for every query. For training sets (R1/R2), candidates are cut to the top `max_cand_train`
-    by `keep_rule` (the truth is always kept). -> (features with qid/pid/label, per-query info)."""
+    by `keep_rule` (the truth is always kept). keep_rule(X) returns one score array or a list of them; with a list
+    the union of each score's top `max_cand_train` is kept. -> (features with qid/pid/label, per-query info)."""
     from .search import FEATURES
     C = searcher.C
     parts, infos = [], []
@@ -147,9 +164,10 @@ def run_queries(searcher, queries, log=print, max_cand_train=300, keep_rule=None
                                                                          hide_pid_lib=q.hide_pid_lib))
         label = (cand == q.pid).astype(np.int8)
         if q.set in TRAIN_SETS and keep_rule is not None and len(cand) > max_cand_train:
-            sc = keep_rule(X)
+            scores = keep_rule(X)
             sel = np.zeros(len(cand), bool)
-            sel[np.argsort(-sc, kind="mergesort")[:max_cand_train]] = True
+            for sc in (scores if isinstance(scores, (list, tuple)) else [scores]):
+                sel[np.argsort(-sc, kind="mergesort")[:max_cand_train]] = True
             sel |= label > 0
             cand, X, label = cand[sel], X[sel], label[sel]
         df = pd.DataFrame(X, columns=FEATURES)

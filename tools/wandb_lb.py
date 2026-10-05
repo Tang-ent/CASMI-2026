@@ -5,13 +5,17 @@ Defaults to the latest submission. The run is named after the submitting kernel 
 for the same submission updates the existing run. --eval-run also writes lb_public into that run's summary.
 """
 import argparse
+import os
 import re
+import sys
 
 import wandb
 from kaggle.api.kaggle_api_extended import KaggleApi
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+from casmi26.track import ENTITY, PROJECT  # noqa: E402
+
 COMP = "enveda-CASMI26-molecule-id-mass-spectra"
-PROJECT = "casmi26"
 
 
 def score(x):
@@ -40,7 +44,7 @@ def main():
     print(cfg, summ)
 
     wapi = wandb.Api()
-    path = f"{wapi.default_entity}/{PROJECT}"
+    path = f"{ENTITY}/{PROJECT}"
     try:
         old = list(wapi.runs(path, filters={"config.submission_ref": s.ref}))
     except (ValueError, wandb.errors.CommError):  # プロジェクトがまだ無い
@@ -49,7 +53,7 @@ def main():
         old[0].summary.update(summ)
         print("updated", old[0].url)
     else:
-        run = wandb.init(project=PROJECT, job_type="lb", group=a.group, name=f"lb-{kernel}-v{version}",
+        run = wandb.init(entity=ENTITY, project=PROJECT, job_type="lb", group=a.group, name=f"lb-{kernel}-v{version}",
                          config=cfg, settings=wandb.Settings(console="off"))
         run.summary.update(summ)
         print("created", run.url)

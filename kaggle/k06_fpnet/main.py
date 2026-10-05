@@ -4,7 +4,8 @@
 # 学習データは train の全スペクトルから、ホールドアウト（A / C / R / V の構造）を除いたもの。
 # 毎エポック、V の構造で「質量窓内の候補に対する f·z の MRR@25」を測り、最良のものを保存する。
 # A（np-examples）の窓内 MRR も参考として出す（選択には使わない）。
-# 学習曲線は wandb にオフラインで記録し、完了後に手元で tools/wandb_sync.py で送る。
+# 学習曲線は wandb に送る。インターネット有効＋Kaggle の Secret「WANDB_API_KEY」をこのノートブックに付けていれば
+# 学習中にリアルタイムで、無ければオフラインで記録し、完了後に手元で tools/wandb_sync.py で送る。
 
 # %%
 import json
@@ -17,6 +18,7 @@ import pandas as pd
 from casmi26 import cache, fpnet, pool, track
 
 PILOT = False  # True: 10% のデータで 1 エポックだけ回して所要時間を測る
+CHECK_ONLY = False  # True: wandb への接続確認だけ行い、学習しない（数分で終わる）
 EPOCHS = 18  # パイロット実測 0.46 h/epoch -> 約 8.3 h（10.5 h の打ち切りと 12 h 制限に余裕を残す）
 EXP = "M2"  # wandb の group
 T0 = time.time()
@@ -41,15 +43,20 @@ print("torch", torch.__version__, "| cuda", torch.cuda.is_available(),
 
 # %%
 FRAC, BUDGET_H = (0.1, 1.5) if PILOT else (1.0, 10.5)
-run = track.init("train", group=EXP, config=dict(
+run = track.init("check" if CHECK_ONLY else "train", group="check" if CHECK_ONLY else EXP, config=dict(
     {k: getattr(fpnet.Cfg, k) for k in dir(fpnet.Cfg) if not k.startswith("_")},
     pilot=PILOT, epochs=1 if PILOT else EPOCHS, frac=FRAC, budget_h=BUDGET_H, n_holdout=len(hold),
     n_val=len(val_q), n_A=len(a_q)))
-hist = fpnet.train(C, P, set(hold.pid.values), val_q, f"{OUT}/fpnet.pt",
-                   frac=FRAC, epochs=1 if PILOT else EPOCHS,
-                   budget_secs=BUDGET_H * 3600, extra_val={"A": a_q}, track=run)
-pd.DataFrame(hist).to_csv(f"{OUT}/fpnet_history.csv", index=False)
-print(pd.DataFrame(hist).round(4).to_string(index=False))
+if CHECK_ONLY:
+    for i in range(1, 4):
+        run.log({"check/value": i}, step=i)
+    hist = []
+else:
+    hist = fpnet.train(C, P, set(hold.pid.values), val_q, f"{OUT}/fpnet.pt",
+                       frac=FRAC, epochs=1 if PILOT else EPOCHS,
+                       budget_secs=BUDGET_H * 3600, extra_val={"A": a_q}, track=run)
+    pd.DataFrame(hist).to_csv(f"{OUT}/fpnet_history.csv", index=False)
+    print(pd.DataFrame(hist).round(4).to_string(index=False))
 
 # %%
 if PILOT and hist:

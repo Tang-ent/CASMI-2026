@@ -210,7 +210,7 @@ class FPModel:
         ck = torch.load(path, map_location="cpu", weights_only=False)
         for k, v in ck["cfg"].items():
             setattr(Cfg, k, v)
-        self.nbits = ck["nbits"]
+        self.nbits, self.epoch = ck["nbits"], ck.get("epoch", -1)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.net = build_model(self.nbits).to(self.device).eval()
         self.net.load_state_dict(ck["model"])
@@ -226,6 +226,20 @@ class FPModel:
         with torch.no_grad():
             z = self.net(b["mz"], b["it"], b["pad"], b["g"], b["ad"]).float()
         return z.mean(0).cpu().numpy()
+
+
+def load_checked(name="fpnet.pt", min_epoch=10, threads=2):
+    """FPModel on CPU from the k06 output; refuses checkpoints before min_epoch (e.g. the 1-epoch pilot).
+    torch gets few threads: inference is milliseconds per query and the library search uses numba's cores."""
+    import torch
+    from . import paths
+    torch.set_num_threads(threads)
+    path = paths.find(name)
+    m = FPModel(path, device="cpu")
+    print(f"[fpnet] {path}: epoch {m.epoch}, d {Cfg.d}, layers {Cfg.layers}, {m.nbits} bits")
+    if m.epoch < min_epoch:
+        raise RuntimeError(f"checkpoint epoch {m.epoch} < {min_epoch}: not the full k06 run")
+    return m
 
 
 # ---------------------------------------------------------------------------------------------- training loop

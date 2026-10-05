@@ -262,7 +262,9 @@ class Searcher:
 def rule_score(X, name):
     """Hand-written baselines on the feature matrix (higher = better).
     'gate:<tau>': molecules whose best library match (lib_grp_max) reaches tau keep the class-1 order (lib_analog);
-    the others are treated as class-2 and ranked by analog evidence (ap4) with a small library term."""
+    the others are treated as class-2 and ranked by analog evidence (ap4) with a small library term.
+    'fz': the spectrum -> fingerprint model alone. 'gfz:<tau>:<w>': same gate, but class-2 molecules are ranked by
+    fz_z + w * (ap4 + 0.2 * lib_max) (w = 0: model only; large w: the gate rule with fz as tie-break)."""
     f = lambda n: X[:, COL[n]]
     tie = 1e-3 * f("ap4") - 1e-6 * f("mass_ppm")
     if name == "lib_max":
@@ -271,6 +273,12 @@ def rule_score(X, name):
         return f("lib_max") + 0.3 * f("lib_mean") + tie
     if name == "lib_analog":
         return f("lib_max") + 0.3 * f("lib_mean") + 0.5 * f("ap4") + tie
+    if name == "fz":
+        return f("fz") + tie
+    if name.startswith("gfz:"):
+        tau, w = map(float, name.split(":")[1:])
+        class1 = f("lib_grp_max") >= tau
+        return np.where(class1, rule_score(X, "lib_analog"), f("fz_z") + w * (f("ap4") + 0.2 * f("lib_max")) + tie)
     if name.startswith("gate:"):
         tau = float(name.split(":")[1])
         class1 = f("lib_grp_max") >= tau
@@ -278,5 +286,13 @@ def rule_score(X, name):
     raise ValueError(name)
 
 
+def hybrid_score(X, tau, rk):
+    """Per-molecule gate: molecules whose best library match (lib_grp_max) reaches tau keep the class-1 order
+    (lib_analog); the others are ranked by the learned score rk (rows aligned with X)."""
+    return np.where(X[:, COL["lib_grp_max"]] >= tau, rule_score(X, "lib_analog"), rk)
+
+
 RULES = ["lib_max", "lib_max_mean", "lib_analog"]
 GATE_RULES = [f"gate:{t}" for t in (0.5, 0.6, 0.7, 0.8, 0.9)]
+GFZ_RULES = [f"gfz:{t}:{w}" for t in (0.5, 0.6, 0.7, 0.8, 0.9) for w in (0, 1, 2, 5, 10)]
+FZ_RULES = ["fz"] + GFZ_RULES

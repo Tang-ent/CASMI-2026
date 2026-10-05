@@ -1,0 +1,29 @@
+# データ・ローカル環境
+.devcontainer
+doc
+enveda-CASMI26-molecule-id-mass-spectra
+
+# Kaggle ユーザー名を含むファイル（雛形は kaggle/kernel-metadata.example.json）
+kaggle/**/kernel-metadata.json
+kaggle/*/build*/
+
+# 認証情報
+.env
+.env.*
+kaggle.json
+.netrc
+*.pem
+*.key
+
+# 実行結果・ログ（kernel 出力、wandb のローカル run）
+out/
+wandb/
+*.log
+
+# Claude Code の個人設定
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/

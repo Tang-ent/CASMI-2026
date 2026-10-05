@@ -3,6 +3,7 @@
 # 候補プール（train ∪ COCONUT）で検証セットの特徴量を計算する。構造（pid）単位で N_SHARDS 個に分け、
 # このカーネルは SHARD 番目だけを処理する（A と B_A、R1 と R2 は同じ構造なので同じ分割に入る）。
 # 結合・評価・ルールの選択は k08_eval2 で行う。
+# v3（M2）: k06 の指紋予測モデルで f·z の特徴量も計算する。R の候補は lib_analog と fz それぞれの上位 300 件の和集合を残す。
 # SHARD / N_SHARDS は tools/build_kernel.py が先頭のセルで注入する（単独実行時は 0 / 1）。
 
 # %%
@@ -12,16 +13,17 @@ import time
 import numpy as np
 import pandas as pd
 
-from casmi26 import cache, harness, paths, pool, search, spectra
+from casmi26 import cache, fpnet, harness, paths, pool, search
 
 SHARD, N_SHARDS = globals().get("SHARD", 0), globals().get("N_SHARDS", 1)
 T0 = time.time()
 OUT = "/kaggle/working"
 BUDGET_R_SECS = 8 * 3600
 
+MODEL = fpnet.load_checked()  # k06 の重み（データセット casmi26-fpnet。エポック 10 未満なら止める）
 C = cache.Cache(cache.Cache.find_dir())
 P = pool.Pool(pool.Pool.find_dir())
-S = search.Searcher(C, P)
+S = search.Searcher(C, P, model=MODEL)
 Q = pd.read_csv(f"{pool.Pool.find_dir()}/queries.csv")
 Q["rows"] = Q.rows.map(lambda s: [int(x) for x in str(s).split(",")])
 Q = Q[Q.set != "V"]
@@ -37,14 +39,16 @@ if SHARD == 0:
     te = pd.read_parquet(os.path.join(paths.comp_dir(), "test.parquet"))
     tops = []
     for mid, g in te.groupby("molecule_id", sort=False):
-        specs = [dict(mz=m, it=i, prec=float(r.precursor_mz), adduct=r.adduct,
-                      mode=1 if r.ionization_mode == "positive" else -1)
-                 for r in g.itertuples()
-                 for m, i in [spectra.clean_one(r.ms2_mzs, r.ms2_normalized_intensities, r.precursor_mz)]]
+        specs = harness.test_specs(g)
         cand, X, info = S.features(specs)
-        tops.append(dict(n_cand=len(cand), lib_max=info["lib_max"], secs=info["secs"]))
+        agree = (float(np.argmax(X[:, search.COL["fz"]]) == np.argmax(search.rule_score(X, "lib_analog")))
+                 if len(cand) else np.nan)
+        tops.append(dict(n_cand=len(cand), lib_max=info["lib_max"], secs=info["secs"], fz_agree=agree,
+                         ce_known=np.mean([np.isfinite(s["ce"]) for s in specs]), tims=specs[0]["tims"]))
     tops = pd.DataFrame(tops)
     print("public test: lib_max >= 0.99 for", f"{(tops.lib_max >= 0.99).mean():.3f}",
+          f"| fz top-1 == library top-1 for {tops.fz_agree.mean():.3f}",
+          f"| CE known {tops.ce_known.mean():.3f} | timsTOF {tops.tims.mean():.3f}",
           f"| median candidates {tops.n_cand.median():.0f} | {tops.secs.mean():.2f}s/molecule ({time.time() - T0:.0f}s)")
 
 # %% [markdown]
@@ -52,7 +56,7 @@ if SHARD == 0:
 # A / B_A / C / B_C を先に、R1 / R2 は同じ構造を対にして 100 構造ずつ処理する（時間切れでも両方が揃う）。
 
 # %%
-keep_rule = lambda X: search.rule_score(X, "lib_analog")
+keep_rule = lambda X: [search.rule_score(X, "lib_analog"), search.rule_score(X, "fz")]
 feats, infos = {}, []
 for name in ["A", "B_A", "C", "B_C"]:
     f, info = harness.run_queries(S, Q[Q.set == name], keep_rule=keep_rule)

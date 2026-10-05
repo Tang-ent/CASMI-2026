@@ -13,6 +13,9 @@ import sys
 
 from kaggle_out import download, list_output
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+from casmi26.track import ENTITY, PROJECT  # noqa: E402
+
 KEEP = re.compile(r"(^|/)wandb/offline-run-[^/]+/(run-[^/]+\.wandb|files/.+)$")
 
 
@@ -29,7 +32,7 @@ def main():
         download(f, path)
     runs = sorted({os.path.dirname(p) for p in glob.glob(f"{path}/**/offline-run-*/run-*.wandb", recursive=True)})
     for r in runs:
-        subprocess.run([sys.executable, "-m", "wandb", "sync", "--yes", r], check=True)
+        subprocess.run([sys.executable, "-m", "wandb", "sync", "--yes", "-e", ENTITY, "-p", PROJECT, r], check=True)
 
 
 if __name__ == "__main__":
