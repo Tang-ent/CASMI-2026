@@ -1,8 +1,9 @@
 #!/bin/bash
-# Local smoke test of the M2 kernels (k07 -> k08 -> k09) in the Kaggle docker image.
+# Local smoke test of the M2 kernels (k07 -> k08 -> k09) and the PubChem probe (k10) in the Kaggle docker image.
 #   tools/smoke/run.sh            # all steps; setup / model are skipped when their output already exists
 #   tools/smoke/run.sh k08 k09    # only these steps
-# Build the notebooks first (python tools/build_kernel.py k07_features2:3 k08_eval2 k09_submit2).
+#   tools/smoke/run.sh pubchem k10 # PubChem probe (pubchem builds out/smoke/pubchem from the heads of the real files)
+# Build the notebooks first (python tools/build_kernel.py k07_features2:3 k08_eval2 k09_submit2 k10_pubchem_probe).
 # Data and outputs go to out/smoke/ (gitignored). Kernel steps run with --network none; setup needs internet (rdkit).
 # k07 runs with a wide mass window (4000 ppm) and max_cand_train=10 so that ranking and the R truncation are
 # exercised on the tiny pool. The resulting MRRs are meaningless (mass_ppm alone finds the truth); this only
@@ -29,6 +30,13 @@ run_kernel() {
   grep -v -i warn "$out/run.log" | tail -"${TAIL:-15}"
 }
 nb() { python3 "$ROOT/tools/smoke/nb2py.py" "$1" "$2"; }
+# rdkit wheel for offline `pip install rdkit` (k10 and setup_pubchem.py), fetched once
+WHEELS=(-v "$D/wheels":/wheels:ro -e PIP_NO_INDEX=1 -e PIP_FIND_LINKS=/wheels)
+wheels() {
+  ls "$D"/wheels/rdkit-*.whl > /dev/null 2>&1 && return
+  mkdir -p "$D/wheels"
+  docker run --rm -v "$D/wheels":/wheels "$IMG" bash -c "pip download -q rdkit -d /wheels --no-deps; chown -R $U /wheels"
+}
 IN_DATA=(-v "$D/data/work":/kaggle/input/k01:ro -v "$D/data/pool":/kaggle/input/k05:ro
          -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/model":/kaggle/input/fpnet:ro
          -v "$COMP":/kaggle/input/enveda-CASMI26-molecule-id-mass-spectra:ro)
@@ -71,6 +79,29 @@ dup = s.smiles.str.split(";").map(lambda x: len(x) - len(set(x))).sum()
 print(f"submission: {len(s)} rows, unique ids {s.molecule_id.is_unique}, candidates {n.min()}-{n.max()}, dups {dup}")
 assert len(s) == 400 and s.molecule_id.is_unique and n.max() <= 25 and dup == 0
 PY
+      ;;
+    pubchem)
+      P=$D/pubchem
+      if [ -f "$P/CID-Mass.gz" ]; then echo "== pubchem: exists"; continue; fi
+      mkdir -p "$P/raw"
+      B=https://ftp.ncbi.nlm.nih.gov/pubchem/Compound/Extras
+      for f in CID-Mass CID-SMILES CID-InChI-Key CID-PMID CID-Synonym-filtered CID-Patent; do
+        [ -s "$P/raw/$f.txt" ] || { curl -s "$B/$f.gz" | gunzip 2>/dev/null | head -30000 > "$P/raw/$f.txt" || true; }
+      done
+      wheels
+      docker run --rm --network none "${WHEELS[@]}" -v "$ROOT":/data "$IMG" \
+        bash -c "python /data/tools/smoke/setup_pubchem.py 2>&1 | tail -8; chown -R $U /data/out/smoke/pubchem" ;;
+    k10)
+      # offline: rdkit from out/smoke/wheels, PubChem files from out/smoke/pubchem (no download, checked below)
+      wheels
+      py=$D/k10.py
+      nb "$ROOT/kaggle/k10_pubchem_probe/build/casmi26-k10-pubchem-probe.ipynb" "$py"
+      sed -i 's/^N_SAMPLE = 3_000_000/N_SAMPLE = 3_000/; s/^N_POS = 300_000/N_POS = 300/; s/^N_SPEED = 20_000/N_SPEED = 200/; s/^BUDGETS = {"S": 1_500_000, "M": 5_000_000, "L": 15_000_000}/BUDGETS = {"S": 1_000, "M": 3_000, "L": 8_000}/' "$py"
+      grep -q "^N_SAMPLE = 3_000 " "$py" && grep -q '^BUDGETS = {"S": 1_000,' "$py" \
+        || { echo "smoke patch did not apply to k10 (source changed?)"; exit 1; }
+      TAIL=${TAIL:-60} run_kernel k10 "$py" "$D/k10" "${WHEELS[@]}" -v "$D/data/work":/kaggle/input/k01:ro \
+        -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/pubchem":/kaggle/input/pubchem:ro
+      if grep -qE "downloaded |zenodo" "$D/k10/run.log"; then echo "k10 smoke downloaded from the internet"; exit 1; fi
       ;;
     *) echo "unknown step $step"; exit 1 ;;
   esac
