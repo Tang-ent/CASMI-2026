@@ -72,6 +72,7 @@ class Searcher:
         self.cfg = cfg or SearchCfg()
         self.sim = sim
         self._pos = np.full(len(self.P), -1, np.int64)
+        self._cand = None  # pids whose _pos entry is set (reset after each query; the pool can be large)
         self.rep_pid = self.P.sid2pid[cache.rep_sid]
 
     # ------------------------------------------------------------------ helpers
@@ -106,7 +107,9 @@ class Searcher:
         try:
             return self._features(specs, hide or {})
         finally:
-            self._pos[:] = -1  # 途中で例外が出ても候補マップを汚さない
+            if self._cand is not None:  # 途中で例外が出ても候補マップを汚さない（使った位置だけ戻す）
+                self._pos[self._cand] = -1
+                self._cand = None
 
     def _features(self, specs, hide):
         C, P, cfg, sim = self.C, self.P, self.cfg, self.sim
@@ -126,6 +129,7 @@ class Searcher:
             return empty
         nc = len(cand)
         pos = self._pos
+        self._cand = cand
         pos[cand] = np.arange(nc)
         X = np.zeros((nc, len(FEATURES)), np.float32)
 

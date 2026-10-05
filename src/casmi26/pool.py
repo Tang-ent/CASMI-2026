@@ -14,6 +14,17 @@ with the neutral train structure, but its formula mass is off by one proton and 
 window. The corrected mass is the train formula mass for structures in train, else the RDKit-uncharged formula mass.
 pids, fingerprints and the holdout are unchanged; windows are searched through `order` (pids sorted by the
 corrected mass).
+
+PubChem part (build_pubchem_part, kernel k05p; M3): spectrum-less PubChem structures appended after the pool, so every
+existing pid (queries, holdout, sid2pid, pool_mass, k07 features, FPNet holdout) stays valid. Its own file names do not
+collide with the pool's (paths.find picks the shortest match):
+  pc_pool.parquet key, smiles, formula, mass (raw formula mass), cid, level, n_pmid, n_syn, n_pat, pcl_anno, np
+  pc_fp.npy       packed fingerprints of the canonical SMILES
+  pc_mass.npy     corrected (uncharged) masses
+  pc_meta.json    counts and the level definitions
+level = the smallest PubChem filter level that contains the structure (1 = S': n_pmid >= 1); the base pool has
+level 0. Pool.set_level(k) restricts windows to level <= k. cid / annotation counts / np are for reporting only, never
+ranking features (harness truths are library compounds, so annotations would leak).
 """
 import io
 import json
@@ -181,11 +192,78 @@ def neutral_masses(d, cache, log=print):
     return mass, stats
 
 
-class Pool:
-    """Candidate pool (pid = row index of pool.parquet, which is sorted by the raw formula mass).
-    Mass windows use `mass_sorted` / `order` (pids sorted by the corrected mass when pool_mass.npy is available)."""
+def uncharged_mass(smiles):
+    """Formula mass after RDKit's Uncharger (NaN on failure). Needs RDKit."""
+    from rdkit import Chem
+    from rdkit.Chem.MolStandardize import rdMolStandardize
+    from rdkit.Chem.rdMolDescriptors import CalcMolFormula
+    m = Chem.MolFromSmiles(smiles) if isinstance(smiles, str) else None
+    if m is None:
+        return np.nan
+    try:
+        return chem.formula_mass(CalcMolFormula(rdMolStandardize.Uncharger().uncharge(m)))
+    except Exception:  # noqa: BLE001
+        return np.nan
 
-    def __init__(self, d=None, cache=None, mass_fix=True):
+
+def build_pubchem_part(cand, base_keys, out_dir, level, level_def, workers=4, log=print, extra_meta=None):
+    """Canonicalise PubChem candidates and write the PubChem part (see the module docstring).
+    cand: DataFrame with cid, smiles and the reporting columns n_pmid, n_syn, n_pat, pcl_anno, np, in the order of
+    preference (the first of several entries with the same key is kept). base_keys: keys of the pool it is appended to."""
+    t0 = time.time()
+    os.makedirs(out_dir, exist_ok=True)
+    cs = _canon_many(cand["smiles"].tolist(), workers, log, "pubchem")
+    ok = np.array([c is not None for c in cs])
+    d = cand[ok].reset_index(drop=True)
+    good = [c for c in cs if c is not None]
+    d["key"] = [c["key"] for c in good]
+    d["smiles"] = [c["smiles"] for c in good]
+    d["formula"] = [c["formula"] for c in good]
+    fp = np.stack([c["fp"] for c in good]).astype(np.uint8) if good else np.zeros((0, chem.FP_BITS // 8), np.uint8)
+    del cs, good
+    stats = dict(n_input=int(len(cand)), failed=int((~ok).sum()))
+    in_base = d.key.isin(set(base_keys)).values
+    dup = d.key.duplicated(keep="first").values
+    keep = ~in_base & ~dup
+    stats.update(in_base_pool=int(in_base.sum()), duplicate_key=int((dup & ~in_base).sum()))
+    d, fp = d[keep].reset_index(drop=True), fp[keep]
+    fm = {f: chem.formula_mass(f) for f in d.formula.unique()}
+    d["mass"] = d.formula.map(fm).astype(np.float64)
+    fin = np.isfinite(d.mass.values)
+    stats["no_mass"] = int((~fin).sum())
+    d, fp = d[fin].reset_index(drop=True), fp[fin]
+    mass = d.mass.values.copy()
+    charged = np.flatnonzero(d.formula.str.contains(r"[+-]\d*$", regex=True).values)
+    um = np.array(map_many(uncharged_mass, d.smiles.values[charged].tolist(), workers)) if len(charged) else np.zeros(0)
+    upd = np.isfinite(um) & (np.abs(um - mass[charged]) > 1e-4)
+    mass[charged[upd]] = um[upd]
+    stats.update(charged=int(len(charged)), uncharged_changed=int(upd.sum()))
+    o = np.argsort(d.mass.values, kind="mergesort")
+    d, fp, mass = d.iloc[o].reset_index(drop=True), fp[o], mass[o]
+    d["level"] = np.int8(level)
+    cols = ["key", "smiles", "formula", "mass", "cid", "level", "n_pmid", "n_syn", "n_pat", "pcl_anno", "np"]
+    d[cols].to_parquet(os.path.join(out_dir, "pc_pool.parquet"), index=False)
+    np.save(os.path.join(out_dir, "pc_fp.npy"), fp)
+    np.save(os.path.join(out_dir, "pc_mass.npy"), mass)
+    meta = dict(n=int(len(d)), levels={str(level): level_def}, **stats, max_tautomers=chem.MAX_TAUTOMERS,
+                secs=round(time.time() - t0), **(extra_meta or {}))
+    json.dump(meta, open(os.path.join(out_dir, "pc_meta.json"), "w"), indent=1)
+    log(f"PubChem part written: {meta}")
+    return meta
+
+
+def map_many(fn, items, workers, chunksize=500):
+    from multiprocessing import Pool as MPool
+    with MPool(workers) as p:
+        return p.map(fn, items, chunksize=chunksize)
+
+
+class Pool:
+    """Candidate pool (pid = row index of pool.parquet, which is sorted by the raw formula mass, followed by the
+    PubChem part when one is attached). Mass windows use `mass_sorted` / `order`: the active pids (level <= the
+    level set with set_level) sorted by the corrected mass when pool_mass.npy / pc_mass.npy are available."""
+
+    def __init__(self, d=None, cache=None, mass_fix=True, pubchem=True):
         if d is None:  # train-only pool straight from the cache (class-1 kernels)
             order = cache.struct_sorted
             s = cache.struct.iloc[order]
@@ -215,9 +293,38 @@ class Pool:
                     self.mass = fixed
                 except FileNotFoundError:
                     print("[Pool] no pool_mass.npy: raw formula masses")
-        self.order = np.argsort(self.mass, kind="mergesort")
-        self.mass_sorted = self.mass[self.order]
+        self.n_base = len(self.key)
+        self.level = np.zeros(self.n_base, np.int8)
+        if d is not None and pubchem:
+            from .paths import find
+            try:
+                self._append_pubchem(os.path.dirname(find("pc_meta.json")))
+            except FileNotFoundError:
+                pass
+        self.set_level(int(self.level.max()))
         print(f"[Pool] {len(self.key):,} structures", flush=True)
+
+    def _append_pubchem(self, pd_dir):
+        q = pd.read_parquet(os.path.join(pd_dir, "pc_pool.parquet"), columns=["key", "smiles", "level"])
+        fp = np.load(os.path.join(pd_dir, "pc_fp.npy"))
+        mass = np.load(os.path.join(pd_dir, "pc_mass.npy"))
+        assert len(q) == len(fp) == len(mass), "PubChem part files differ in length"
+        self.key = np.concatenate([self.key, q["key"].values])
+        self.smiles = np.concatenate([self.smiles, q["smiles"].values])
+        self.mass = np.concatenate([self.mass, mass])
+        self.in_train = np.concatenate([self.in_train, np.zeros(len(q), bool)])
+        self.fp = np.concatenate([self.fp, fp])
+        self.level = np.concatenate([self.level, q["level"].values.astype(np.int8)])
+        self.pc_meta = json.load(open(os.path.join(pd_dir, "pc_meta.json")))
+        print(f"[Pool] PubChem part: {len(q):,} structures from {pd_dir}, levels {self.pc_meta.get('levels')}")
+
+    def set_level(self, k):
+        """Windows (and nearest_structures) use only pids with level <= k (0 = the pool without PubChem)."""
+        act = np.flatnonzero(self.level <= k)
+        self.active_level = k
+        self.order = act[np.argsort(self.mass[act], kind="mergesort")]
+        self.mass_sorted = self.mass[self.order]
+        print(f"[Pool] level <= {k}: {len(self.order):,} active of {len(self.key):,}", flush=True)
 
     def window(self, target, ppm):
         """pids whose (corrected) mass is within +-ppm of target."""
