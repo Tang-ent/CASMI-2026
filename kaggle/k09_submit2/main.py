@@ -4,6 +4,7 @@
 # k01 のキャッシュ、k05 の候補プール（train ∪ COCONUT）、k08 が選んだスコアで、分子ごとに最大25件を出力する。
 # v2（M2）: k06 の指紋予測モデルで f·z の特徴量も計算する（CPU で推論）。スペクトルには CE と装置の情報も渡す。
 # v3（M2.1）: variant に tau があれば、lib_grp_max ≥ tau の分子は lib_analog、それ以外はランカーで順位を付ける。
+# v4（M2.2）: variant に w もあれば、クラス2側は z(ランカー) + w·(ap4 + 0.2·lib_max)（search.blend_score。z は分子ごと）。
 
 # %%
 import json
@@ -34,7 +35,12 @@ else:
     models = [lgb.Booster(model_file=f"{RK_DIR}/{fn}") for fn in v["files"]]
     fidx = [search.COL[c] for c in v["features"]]
     rk_fn = lambda X: np.mean([m.predict(X[:, fidx]) for m in models], axis=0)
-    score_fn = (lambda X: search.hybrid_score(X, v["tau"], rk_fn(X))) if "tau" in v else rk_fn
+    if "w" in v:
+        score_fn = lambda X: search.blend_score(X, v["tau"], rk_fn(X), v["w"])  # X = one molecule
+    elif "tau" in v:
+        score_fn = lambda X: search.hybrid_score(X, v["tau"], rk_fn(X))
+    else:
+        score_fn = rk_fn
     print("variant:", {k: x for k, x in v.items() if k != "features"})
 print("score:", VARIANT)
 

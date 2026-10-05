@@ -292,6 +292,27 @@ def hybrid_score(X, tau, rk):
     return np.where(X[:, COL["lib_grp_max"]] >= tau, rule_score(X, "lib_analog"), rk)
 
 
+def zscore_by(v, qid=None):
+    """Per-molecule z-score of v (rows grouped by qid; qid=None = all rows are one molecule). Constant -> 0."""
+    v = np.asarray(v, np.float64)
+    if qid is None:
+        qid = np.zeros(len(v), np.int64)
+    _, inv = np.unique(qid, return_inverse=True)
+    n = np.bincount(inv)
+    mu = np.bincount(inv, v) / n
+    sd = np.sqrt(np.maximum(np.bincount(inv, v * v) / n - mu ** 2, 0.0))
+    return np.where(sd[inv] > 1e-9, (v - mu[inv]) / np.where(sd[inv] > 1e-9, sd[inv], 1.0), 0.0)
+
+
+def blend_score(X, tau, rk, w, qid=None):
+    """hybrid_score whose class-2 branch is z(rk) + w * (ap4 + 0.2 * lib_max): gfz with the learned score rk in place
+    of fz_z (z = per-molecule z-score, so w means the same in k08, which scores all molecules at once with qid, and
+    k09, which scores one molecule with qid=None)."""
+    f = lambda n: X[:, COL[n]]
+    tie = 1e-3 * f("ap4") - 1e-6 * f("mass_ppm")
+    return hybrid_score(X, tau, zscore_by(rk, qid) + w * (f("ap4") + 0.2 * f("lib_max")) + tie)
+
+
 RULES = ["lib_max", "lib_max_mean", "lib_analog"]
 GATE_RULES = [f"gate:{t}" for t in (0.5, 0.6, 0.7, 0.8, 0.9)]
 GFZ_RULES = [f"gfz:{t}:{w}" for t in (0.5, 0.6, 0.7, 0.8, 0.9) for w in (0, 1, 2, 5, 10)]
