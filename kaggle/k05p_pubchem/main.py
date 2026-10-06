@@ -79,7 +79,8 @@ del t
 # %%
 P = pool.Pool(PD)
 assert len(P) == P.n_base + meta["n"] and P.n_base == len(base_keys)
-assert not np.isin(P.key[P.n_base:], base_keys).any(), "PubChem part overlaps the pool"
+# np.isin は object 型の配列だと要素ごとのループになり、214 万 × 72 万で終わらない（v1 はここで 12 時間止まった）
+assert not pd.Series(P.key[P.n_base:]).isin(set(base_keys)).any(), "PubChem part overlaps the pool"
 assert np.isfinite(P.mass).all()
 Q = pd.read_csv(os.path.join(PD, "queries.csv"), usecols=["set", "pid"])
 for s in ["A", "C", "R1"]:

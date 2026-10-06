@@ -4,6 +4,9 @@
 # このカーネルは SHARD 番目だけを処理する（A と B_A、R1 と R2 は同じ構造なので同じ分割に入る）。
 # 結合・評価・ルールの選択は k08_eval2 で行う。
 # v3（M2）: k06 の指紋予測モデルで f·z の特徴量も計算する。R の候補は lib_analog と fz それぞれの上位 300 件の和集合を残す。
+# v5（M3）: 候補プールに PubChem 部分（段階 S′ = 文献数 ≥ 1。k05p v1 の出力をデータセット casmi26-pubchem-part にしたもの）をつなぐ。つながっていなければ止める
+#   （Pool は pc_meta.json が無いと黙って PubChem なしで動くため）。候補が増えるので、R の切り詰めの上限を
+#   keep_rule ごとに 300 → 1,000 に上げる。
 # SHARD / N_SHARDS は tools/build_kernel.py が先頭のセルで注入する（単独実行時は 0 / 1）。
 
 # %%
@@ -19,10 +22,13 @@ SHARD, N_SHARDS = globals().get("SHARD", 0), globals().get("N_SHARDS", 1)
 T0 = time.time()
 OUT = "/kaggle/working"
 BUDGET_R_SECS = 8 * 3600
+MAX_CAND_TRAIN = 1000  # R1/R2 の切り詰めの上限（keep_rule ごと。v4 までは 300）
 
 MODEL = fpnet.load_checked()  # k06 の重み（データセット casmi26-fpnet。エポック 10 未満なら止める）
 C = cache.Cache(cache.Cache.find_dir())
 P = pool.Pool(pool.Pool.find_dir())
+assert P.level.max() == 1 and len(P) > P.n_base, "PubChem part (dataset casmi26-pubchem-part) is not attached"
+print(f"PubChem part: {len(P) - P.n_base:,} structures, levels {P.pc_meta['levels']}")
 S = search.Searcher(C, P, model=MODEL)
 Q = pd.read_csv(f"{pool.Pool.find_dir()}/queries.csv")
 Q["rows"] = Q.rows.map(lambda s: [int(x) for x in str(s).split(",")])
@@ -59,7 +65,7 @@ if SHARD == 0:
 keep_rule = lambda X: [search.rule_score(X, "lib_analog"), search.rule_score(X, "fz")]
 feats, infos = {}, []
 for name in ["A", "B_A", "C", "B_C"]:
-    f, info = harness.run_queries(S, Q[Q.set == name], keep_rule=keep_rule)
+    f, info = harness.run_queries(S, Q[Q.set == name], keep_rule=keep_rule, max_cand_train=MAX_CAND_TRAIN)
     feats[name] = f
     infos.append(info)
     print(f"set {name}: {len(info)} queries, recall {info.recall.mean():.3f}, median candidates "
@@ -74,7 +80,7 @@ for i in range(0, len(r_pids), 100):
     chunk = set(r_pids[i:i + 100])
     for name in ["R1", "R2"]:
         parts[name].append(harness.run_queries(S, Q[(Q.set == name) & Q.pid.isin(chunk)], keep_rule=keep_rule,
-                                               log=lambda *a: None))
+                                               max_cand_train=MAX_CAND_TRAIN, log=lambda *a: None))
     print(f"  R {min(i + 100, len(r_pids))}/{len(r_pids)} structures ({time.time() - T0:.0f}s)", flush=True)
 for name in ["R1", "R2"]:
     if parts[name]:

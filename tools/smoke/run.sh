@@ -3,7 +3,7 @@
 #   tools/smoke/run.sh            # all steps; setup / model are skipped when their output already exists
 #   tools/smoke/run.sh k08 k09    # only these steps
 #   tools/smoke/run.sh pubchem k10 # PubChem probe (pubchem builds out/smoke/pubchem from the heads of the real files)
-#   tools/smoke/run.sh k05p; PC=1 tools/smoke/run.sh k07 k08 k09   # PubChem part, then the kernels with it attached
+#   tools/smoke/run.sh k05p; PC=1 tools/smoke/run.sh k07 k11 k12  # M3: PubChem part, then the kernels with it attached
 # Build the notebooks first (python tools/build_kernel.py k07_features2:3 k08_eval2 k09_submit2 k10_pubchem_probe).
 # Data and outputs go to out/smoke/ (gitignored). Kernel steps run with --network none; setup needs internet (rdkit).
 # k07 runs with a wide mass window (4000 ppm) and max_cand_train=10 so that ranking and the R truncation are
@@ -31,6 +31,17 @@ run_kernel() {
   grep -v -i warn "$out/run.log" | tail -"${TAIL:-15}"
 }
 nb() { python3 "$ROOT/tools/smoke/nb2py.py" "$1" "$2"; }
+check_sub() {
+  python3 - "$1" <<'PY'
+import sys
+import pandas as pd
+s = pd.read_csv(sys.argv[1])
+n = s.smiles.str.split(";").map(len)
+dup = s.smiles.str.split(";").map(lambda x: len(x) - len(set(x))).sum()
+print(f"submission: {len(s)} rows, unique ids {s.molecule_id.is_unique}, candidates {n.min()}-{n.max()}, dups {dup}")
+assert len(s) == 400 and s.molecule_id.is_unique and n.max() <= 25 and dup == 0
+PY
+}
 # rdkit wheel for offline `pip install rdkit` (k10 and setup_pubchem.py), fetched once
 WHEELS=(-v "$D/wheels":/wheels:ro -e PIP_NO_INDEX=1 -e PIP_FIND_LINKS=/wheels)
 wheels() {
@@ -61,8 +72,8 @@ for step in $STEPS; do
       for i in 0 1 2; do
         py=$D/k07_s$i.py
         nb "$ROOT/kaggle/k07_features2/build_s$i/casmi26-k07-features2-s$i.ipynb" "$py"
-        sed -i 's/S = search.Searcher(C, P, model=MODEL)/S = search.Searcher(C, P, cfg=search.SearchCfg(ppm_win=4000, ppm_fallback=8000), model=MODEL)/; s/keep_rule=keep_rule/keep_rule=keep_rule, max_cand_train=10/g' "$py"
-        grep -q "ppm_win=4000" "$py" && grep -q "max_cand_train=10" "$py" \
+        sed -i 's/S = search.Searcher(C, P, model=MODEL)/S = search.Searcher(C, P, cfg=search.SearchCfg(ppm_win=4000, ppm_fallback=8000), model=MODEL)/; s/^MAX_CAND_TRAIN = 1000/MAX_CAND_TRAIN = 10/' "$py"
+        grep -q "ppm_win=4000" "$py" && grep -q "^MAX_CAND_TRAIN = 10 " "$py" \
           || { echo "smoke patch did not apply to k07 (source changed?)"; exit 1; }
         TAIL=2 run_kernel "k07 shard $i" "$py" "$D/k07_s$i" "${IN_DATA[@]}"
       done ;;
@@ -73,16 +84,17 @@ for step in $STEPS; do
     k09)
       nb "$ROOT/kaggle/k09_submit2/build/casmi26-k09-submit2.ipynb" "$D/k09.py"
       TAIL=8 run_kernel k09 "$D/k09.py" "$D/k09" "${IN_DATA[@]}" -v "$D/k08":/kaggle/input/k08:ro
-      python3 - "$D/k09/submission.csv" <<'PY'
-import sys
-import pandas as pd
-s = pd.read_csv(sys.argv[1])
-n = s.smiles.str.split(";").map(len)
-dup = s.smiles.str.split(";").map(lambda x: len(x) - len(set(x))).sum()
-print(f"submission: {len(s)} rows, unique ids {s.molecule_id.is_unique}, candidates {n.min()}-{n.max()}, dups {dup}")
-assert len(s) == 400 and s.molecule_id.is_unique and n.max() <= 25 and dup == 0
-PY
-      ;;
+      check_sub "$D/k09/submission.csv" ;;
+    k11)
+      nb "$ROOT/kaggle/k11_eval3/build/casmi26-k11-eval3.ipynb" "$D/k11.py"
+      TAIL=${TAIL:-40} run_kernel k11 "$D/k11.py" "$D/k11" -v "$D/k07_s0":/kaggle/input/s0:ro \
+        -v "$D/k07_s1":/kaggle/input/s1:ro -v "$D/k07_s2":/kaggle/input/s2:ro -v "$D/data/pool":/kaggle/input/k05:ro \
+        -v "$D/k10":/kaggle/input/k10:ro ;;
+    k12)
+      nb "$ROOT/kaggle/k12_submit3/build/casmi26-k12-submit3.ipynb" "$D/k12.py"
+      # needs PC=1 (the PubChem part in IN_DATA); k12 stops if it is not attached
+      TAIL=8 run_kernel k12 "$D/k12.py" "$D/k12" "${IN_DATA[@]}" -v "$D/k11":/kaggle/input/k11:ro
+      check_sub "$D/k12/submission.csv" ;;
     pubchem)
       P=$D/pubchem
       if [ -f "$P/CID-Mass.gz" ]; then echo "== pubchem: exists"; continue; fi
