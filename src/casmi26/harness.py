@@ -200,3 +200,28 @@ def metrics(ranks, k=25):
     n = len(r)
     return dict(n=n, mrr25=rr.mean() if n else np.nan, mrr_se=rr.std(ddof=1) / np.sqrt(n) if n > 1 else np.nan,
                 top1=(r <= 1).mean(), top10=(r <= 10).mean(), top25=(r <= 25).mean(), recall=np.isfinite(r).mean())
+
+
+# ---------------------------------------------------------------- uncertainty (yardstick review, 2026-10-07)
+def rr_of(ranks, k=25):
+    """Reciprocal rank at k (0 beyond k or when the truth is absent)."""
+    r = np.asarray(ranks, float)
+    return np.where(r <= k, 1.0 / r, 0.0)
+
+
+def boot_index(n, n_boot=2000, seed=0):
+    """Bootstrap resamples of n queries (n_boot, n). Reuse one index for every model of a set, so that differences
+    of replicate means are paired bootstrap differences."""
+    return np.random.default_rng(seed).integers(0, n, size=(n_boot, n))
+
+
+def boot_reps(x, idx):
+    """Replicate means of x under the resamples idx (from boot_index(len(x)))."""
+    return np.asarray(x, float)[idx].mean(1)
+
+
+def ci(point, reps, level=0.95):
+    """dict(est, se, lo, hi) from a point estimate and its bootstrap replicates (percentile interval)."""
+    a = (1 - level) / 2
+    return dict(est=float(point), se=float(np.std(reps, ddof=1)), lo=float(np.quantile(reps, a)),
+                hi=float(np.quantile(reps, 1 - a)))

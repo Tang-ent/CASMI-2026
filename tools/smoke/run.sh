@@ -3,10 +3,11 @@
 #   tools/smoke/run.sh            # all steps; setup / model are skipped when their output already exists
 #   tools/smoke/run.sh k08 k09    # only these steps
 #   tools/smoke/run.sh pubchem k10 # PubChem probe (pubchem builds out/smoke/pubchem from the heads of the real files)
-#   tools/smoke/run.sh k05p; PC=1 tools/smoke/run.sh k07 k11 k12  # M3: PubChem part, then the kernels with it attached
+#   tools/smoke/run.sh k05p; PC=1 tools/smoke/run.sh k07 k13     # yardstick: k07 v7 (levels 0 and 1) and k13
+#   (k08 / k11 read the pre-v7 feature names feats_<set>_s<i> and no longer run on k07 v7 output)
 # Build the notebooks first (python tools/build_kernel.py k07_features2:3 k08_eval2 k09_submit2 k10_pubchem_probe).
 # Data and outputs go to out/smoke/ (gitignored). Kernel steps run with --network none; setup needs internet (rdkit).
-# k07 runs with a wide mass window (4000 ppm) and max_cand_train=10 so that ranking and the R truncation are
+# k07 runs with a wide mass window (4000 ppm) and a truncation cap of 10 so that ranking and the R truncation are
 # exercised on the tiny pool. The resulting MRRs are meaningless (mass_ppm alone finds the truth); this only
 # checks that every kernel runs end to end and writes well-formed outputs.
 set -euo pipefail
@@ -72,8 +73,8 @@ for step in $STEPS; do
       for i in 0 1 2; do
         py=$D/k07_s$i.py
         nb "$ROOT/kaggle/k07_features2/build_s$i/casmi26-k07-features2-s$i.ipynb" "$py"
-        sed -i 's/S = search.Searcher(C, P, model=MODEL)/S = search.Searcher(C, P, cfg=search.SearchCfg(ppm_win=4000, ppm_fallback=8000), model=MODEL)/; s/^MAX_CAND_TRAIN = 1000/MAX_CAND_TRAIN = 10/' "$py"
-        grep -q "ppm_win=4000" "$py" && grep -q "^MAX_CAND_TRAIN = 10 " "$py" \
+        sed -i 's/S = search.Searcher(C, P, model=MODEL)/S = search.Searcher(C, P, cfg=search.SearchCfg(ppm_win=4000, ppm_fallback=8000), model=MODEL)/; s/^LEVELS = {0: 300, 1: 1000}/LEVELS = {0: 10, 1: 10}/' "$py"
+        grep -q "ppm_win=4000" "$py" && grep -q "^LEVELS = {0: 10, 1: 10} " "$py" \
           || { echo "smoke patch did not apply to k07 (source changed?)"; exit 1; }
         TAIL=2 run_kernel "k07 shard $i" "$py" "$D/k07_s$i" "${IN_DATA[@]}"
       done ;;
@@ -126,6 +127,12 @@ for step in $STEPS; do
         -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k10":/kaggle/input/k10:ro -v "$D/pubchem":/kaggle/input/pubchem:ro
       if grep -qE "downloaded " "$D/k05p/run.log"; then echo "k05p smoke downloaded from the internet"; exit 1; fi
       ;;
+    k13)
+      nb "$ROOT/kaggle/k13_yardstick/build/casmi26-k13-yardstick.ipynb" "$D/k13.py"
+      sed -i 's/^N_BOOT = 2000/N_BOOT = 200/' "$D/k13.py"
+      TAIL=${TAIL:-40} run_kernel k13 "$D/k13.py" "$D/k13" -v "$D/k07_s0":/kaggle/input/s0:ro \
+        -v "$D/k07_s1":/kaggle/input/s1:ro -v "$D/k07_s2":/kaggle/input/s2:ro -v "$D/data/pool":/kaggle/input/k05:ro \
+        -v "$D/k10":/kaggle/input/k10:ro ;;
     *) echo "unknown step $step"; exit 1 ;;
   esac
 done
