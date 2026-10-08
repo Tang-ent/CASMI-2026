@@ -4,6 +4,8 @@
     kaggle kernels push -p kaggle/k01_cache/build
     python tools/build_kernel.py k07_features2:3  -> kaggle/k07_features2/build_s{0,1,2}/  (3 shard kernels <slug>-s<i>;
                                                      a cell `SHARD, N_SHARDS = i, 3` is injected after the boot cell)
+kernel-metadata.json may carry "shard_kernel_sources": {"<i>": [...]}: extra kernel sources for shard i only
+(e.g. a later variant that reads an earlier shard's output); the key is removed from the pushed metadata.
 
 main.py is split into cells at lines starting with '# %%' ('# %% [markdown]' = markdown cell, '# ' stripped).
 The first code cell writes the casmi26 package to /tmp/casmi26_src and puts it on sys.path, so every
@@ -69,8 +71,10 @@ def to_cell(kind, body):
 def build(kernel, shard=None, n_shards=1):
     kdir = ROOT / "kaggle" / kernel
     meta = json.loads((kdir / "kernel-metadata.json").read_text())
+    extra = meta.pop("shard_kernel_sources", {})
     out = kdir / "build"
     if shard is not None:
+        meta["kernel_sources"] = meta["kernel_sources"] + extra.get(str(shard), [])
         meta["id"] += f"-s{shard}"
         meta["title"] += f"-s{shard}"
         out = kdir / f"build_s{shard}"

@@ -11,9 +11,15 @@
 #   出力の名前に段階を入れる（feats_<set>_L<段階>_s<分割>）。R の切り詰めの上限は当時に合わせて段階 0 は 300、
 #   段階 1 は 1,000。FPNet の検証用の V（2,000 構造、正解のスペクトルをすべて隠す）も計算する。V は FPNet の学習に
 #   使われていないので、R2 と合わせて大きなクラス2の代理（正解が COCONUT にあるもの）に使う。評価は k13_yardstick。
+# v8 / v9（M4、2026-10-07 / 08）: FPNet を v2（k15_fpnet2 の fpnet2.pt。v2a / v2b のうち k15 の判定で選んだ方を入力にする。
+#   v8 = v2a、v9 = v2b（k15 s1 の判定で v2b を使う: 偏りの係数 −0.33 → −0.20、B_N は v2a に非劣性））に替える。
+#   PubChem は止めたので段階 0 だけ（R の切り詰めの上限 300）。PubChem がつながっていないことを確かめる。
+#   使った FPNet の情報を fpnet_info.json に書く（k16 / k17 が確かめる）。評価は k16_eval4。
 # SHARD / N_SHARDS は tools/build_kernel.py が先頭のセルで注入する（単独実行時は 0 / 1）。
 
 # %%
+import glob
+import json
 import os
 import time
 
@@ -26,14 +32,19 @@ SHARD, N_SHARDS = globals().get("SHARD", 0), globals().get("N_SHARDS", 1)
 T0 = time.time()
 OUT = "/kaggle/working"
 BUDGET_R_SECS = 4 * 3600  # 段階ごと
-LEVELS = {0: 300, 1: 1000}  # プールの段階 -> R1/R2 の切り詰めの上限（keep_rule ごと）
+LEVELS = {0: 300}  # プールの段階 -> R1/R2 の切り詰めの上限（keep_rule ごと）
 SETS = ["A", "B_A", "C", "B_C", "V"]  # R1 / R2 は別に、構造を対にして処理する
 
-MODEL = fpnet.load_checked()  # k06 の重み（データセット casmi26-fpnet。エポック 10 未満なら止める）
+MODEL = fpnet.load_checked("fpnet2.pt", min_epoch=1)  # k15 の重み（v2a または v2b）
+res = [json.load(open(p)) for p in glob.glob("/kaggle/input/**/result_v2*.json", recursive=True)]
+assert len(res) == 1, f"attach exactly one k15 variant (found {len(res)})"
+FPNET_INFO = dict(fpnet="fpnet2.pt", variant=res[0]["variant"], epoch=int(MODEL.epoch), prep=MODEL.prep,
+                  gate=res[0]["gate"], k07="v8")
+assert FPNET_INFO["epoch"] == res[0]["epoch"], "fpnet2.pt and result_v2*.json come from different runs"
+print("FPNet:", FPNET_INFO)
 C = cache.Cache(cache.Cache.find_dir())
 P = pool.Pool(pool.Pool.find_dir())
-assert P.level.max() == 1 and len(P) > P.n_base, "PubChem part (dataset casmi26-pubchem-part) is not attached"
-print(f"PubChem part: {len(P) - P.n_base:,} structures, levels {P.pc_meta['levels']}")
+assert len(P) == P.n_base, "the PubChem part must not be attached (PubChem was stopped after M3)"
 S = search.Searcher(C, P, model=MODEL)
 Q = pd.read_csv(f"{pool.Pool.find_dir()}/queries.csv")
 Q["rows"] = Q.rows.map(lambda s: [int(x) for x in str(s).split(",")])
@@ -67,6 +78,7 @@ if SHARD == 0:
 
 # %%
 keep_rule = lambda X: [search.rule_score(X, "lib_analog"), search.rule_score(X, "fz")]
+json.dump(FPNET_INFO, open(f"{OUT}/fpnet_info.json", "w"), indent=1)
 for level, cap in LEVELS.items():
     P.set_level(level)
     feats, infos = {}, []

@@ -137,3 +137,26 @@ def score_key(smiles):
     """Metric key: InChIKey14 after RDKit tautomer canonicalisation (None on failure)."""
     c = canonical(smiles)
     return c["key"] if c else None
+
+
+ALT_FPS = ("morgan3_4096", "morgan2+maccs+ap")
+
+
+def alt_fps(smiles):
+    """Alternative packed fingerprints of a SMILES (M4 fingerprint-ceiling check; zeros when RDKit cannot parse):
+    Morgan r=3 4096 bits, and Morgan r=2 2048 + MACCS 167 + atom pairs 2048 concatenated (4263 bits)."""
+    r = _rdkit()
+    if "g3" not in r:
+        from rdkit import DataStructs
+        from rdkit.Chem import MACCSkeys, rdFingerprintGenerator
+        r.update(g3=rdFingerprintGenerator.GetMorganGenerator(radius=3, fpSize=4096),
+                 ap=rdFingerprintGenerator.GetAtomPairGenerator(fpSize=2048), maccs=MACCSkeys.GenMACCSKeys,
+                 ds=DataStructs)
+    m = r["Chem"].MolFromSmiles(smiles) if isinstance(smiles, str) else None
+    if m is None:
+        return np.zeros(512, np.uint8), np.zeros((2048 + 167 + 2048 + 7) // 8, np.uint8)
+    mac = np.zeros(167, np.uint8)
+    r["ds"].ConvertToNumpyArray(r["maccs"](m), mac)
+    multi = np.concatenate([r["gen"].GetFingerprintAsNumPy(m).astype(np.uint8), mac,
+                            r["ap"].GetFingerprintAsNumPy(m).astype(np.uint8)])
+    return np.packbits(r["g3"].GetFingerprintAsNumPy(m).astype(np.uint8)), np.packbits(multi)

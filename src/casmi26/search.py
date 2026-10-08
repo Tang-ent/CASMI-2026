@@ -321,3 +321,80 @@ RULES = ["lib_max", "lib_max_mean", "lib_analog"]
 GATE_RULES = [f"gate:{t}" for t in (0.5, 0.6, 0.7, 0.8, 0.9)]
 GFZ_RULES = [f"gfz:{t}:{w}" for t in (0.5, 0.6, 0.7, 0.8, 0.9) for w in (0, 1, 2, 5, 10)]
 FZ_RULES = ["fz"] + GFZ_RULES
+
+
+# ---------------------------------------------------------------- M4: per-molecule router (class 1 or not)
+ROUTE_FEATURES = ["lib_grp_max", "lib_grp_gap2", "n_cand", "n_query", "n_pos", "target_mass", "top_sim",
+                  "n_analog_hi", "ap4_max", "fz_rank_libtop", "same_top", "libmax_fztop", "fz_soft_libtop",
+                  "rk_margin", "rk_libtop", "libmax_rktop", "la_margin"]
+
+
+def _top2_margin(v, inv, n_groups):
+    """Per group: largest - second largest of v (0 for single-row groups). inv = group index of each row."""
+    o = np.lexsort((-v, inv))
+    vs, gs = v[o], inv[o]
+    first = np.r_[True, gs[1:] != gs[:-1]]
+    second = np.r_[False, first[:-1]] & ~first
+    top = np.zeros(n_groups)
+    top[gs[first]] = vs[first]
+    sec = top.copy()
+    sec[gs[second]] = vs[second]
+    return top - sec
+
+
+def route_features(X, rk, qid=None):
+    """Molecule-level features for the router (one row per qid, sorted; qid=None = one molecule): the library
+    channel's group context, how well fz and the learned score rk agree with the library's top candidate, and the
+    score margins. Uses only the per-candidate features and rk (no provenance). -> (qids, matrix in ROUTE_FEATURES)."""
+    f = lambda n: X[:, COL[n]].astype(np.float64)
+    n = len(X)
+    if qid is None:
+        qid = np.zeros(n, np.int64)
+    uq, inv = np.unique(qid, return_inverse=True)
+    G = len(uq)
+    srt = np.lexsort((np.arange(n), inv))  # rows grouped by molecule (stable)
+    starts = np.r_[0, np.cumsum(np.bincount(inv, minlength=G))[:-1]]
+    lib, fz, rkz = f("lib_max"), f("fz"), zscore_by(rk, qid)
+    la = rule_score(X, "lib_analog").astype(np.float64)
+
+    def by_desc(v):
+        """Rows sorted by molecule, then by v descending; -> (order, 1-based rank of each row in its molecule)."""
+        o = np.lexsort((-v, inv))
+        r = np.empty(n)
+        r[o] = np.arange(n) - starts[inv[o]] + 1
+        return o, r
+
+    o_lib, _ = by_desc(lib)
+    o_fz, fz_rank = by_desc(fz)
+    o_rk, _ = by_desc(rkz)
+    i_lib, i_fz, i_rk = o_lib[starts], o_fz[starts], o_rk[starts]
+    R = np.zeros((G, len(ROUTE_FEATURES)))
+    col = {c: j for j, c in enumerate(ROUTE_FEATURES)}
+    for c in ["lib_grp_max", "lib_grp_gap2", "n_cand", "n_query", "n_pos", "target_mass", "top_sim", "n_analog_hi"]:
+        R[:, col[c]] = f(c)[srt[starts]]
+    R[:, col["ap4_max"]] = np.maximum.reduceat(f("ap4")[srt], starts)
+    R[:, col["fz_rank_libtop"]] = np.minimum(fz_rank[i_lib], 300)
+    R[:, col["same_top"]] = (i_lib == i_fz).astype(float)
+    R[:, col["libmax_fztop"]] = lib[i_fz]
+    R[:, col["fz_soft_libtop"]] = f("fz_soft")[i_lib]
+    R[:, col["rk_margin"]] = _top2_margin(rkz, inv, G)
+    R[:, col["rk_libtop"]] = rkz[i_lib]
+    R[:, col["libmax_rktop"]] = lib[i_rk]
+    R[:, col["la_margin"]] = _top2_margin(la, inv, G)
+    return uq, R
+
+
+def route_score(X, rk, p, w, mode, t=0.5, qid=None):
+    """Routed score with the router's class-1 probability p (one value per row, i.e. p of the row's molecule).
+    The class-2 branch is blend_score's: z(rk) + w * (ap4 + 0.2 * lib_max).
+    mode 'hard': lib_analog where p >= t, else the class-2 branch.
+    mode 'soft': p * z(lib_analog) + (1 - p) * z(class-2 branch), z per molecule."""
+    f = lambda n: X[:, COL[n]]
+    tie = 1e-3 * f("ap4") - 1e-6 * f("mass_ppm")
+    c2 = zscore_by(rk, qid) + w * (f("ap4") + 0.2 * f("lib_max")) + tie
+    la = rule_score(X, "lib_analog")
+    if mode == "hard":
+        return np.where(p >= t, la, c2)
+    if mode == "soft":
+        return p * zscore_by(la, qid) + (1 - p) * zscore_by(c2, qid) + tie
+    raise ValueError(mode)

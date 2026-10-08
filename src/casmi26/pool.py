@@ -274,6 +274,7 @@ class Pool:
             self.sid2pid = np.full(len(cache.struct), -1, np.int64)
             self.sid2pid[order] = np.arange(len(order))
             self.in_train = np.ones(len(order), bool)
+            self.in_coconut = np.zeros(len(order), bool)
             self.meta = dict(n_pool=len(order), train_only=True)
         else:
             p = pd.read_parquet(os.path.join(d, "pool.parquet"))
@@ -281,6 +282,7 @@ class Pool:
             self.smiles = p["smiles"].values
             self.mass = p["mass"].values.astype(np.float64)
             self.in_train = p["in_train"].values
+            self.in_coconut = p["in_coconut"].values if "in_coconut" in p else np.zeros(len(p), bool)
             self.fp = np.load(os.path.join(d, "pool_fp.npy"))
             self.sid2pid = np.load(os.path.join(d, "sid2pid.npy"))
             self.meta = json.load(open(os.path.join(d, "pool_meta.json")))
@@ -313,6 +315,7 @@ class Pool:
         self.smiles = np.concatenate([self.smiles, q["smiles"].values])
         self.mass = np.concatenate([self.mass, mass])
         self.in_train = np.concatenate([self.in_train, np.zeros(len(q), bool)])
+        self.in_coconut = np.concatenate([self.in_coconut, np.zeros(len(q), bool)])
         self.fp = np.concatenate([self.fp, fp])
         self.level = np.concatenate([self.level, q["level"].values.astype(np.int8)])
         self.pc_meta = json.load(open(os.path.join(pd_dir, "pc_meta.json")))

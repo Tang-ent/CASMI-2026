@@ -225,3 +225,11 @@ def ci(point, reps, level=0.95):
     a = (1 - level) / 2
     return dict(est=float(point), se=float(np.std(reps, ddof=1)), lo=float(np.quantile(reps, a)),
                 hi=float(np.quantile(reps, 1 - a)))
+
+
+def paired_ci(x, y, n_boot=2000, seed=0, level=0.95):
+    """Mean of x - y over paired queries with its bootstrap interval: dict(est, se, lo, hi, n)."""
+    d = np.asarray(x, float) - np.asarray(y, float)
+    out = ci(d.mean(), boot_reps(d, boot_index(len(d), n_boot, seed)), level) if len(d) else \
+        dict(est=np.nan, se=np.nan, lo=np.nan, hi=np.nan)
+    return dict(out, n=len(d))

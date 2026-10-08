@@ -4,6 +4,8 @@
 #   tools/smoke/run.sh k08 k09    # only these steps
 #   tools/smoke/run.sh pubchem k10 # PubChem probe (pubchem builds out/smoke/pubchem from the heads of the real files)
 #   tools/smoke/run.sh k05p; PC=1 tools/smoke/run.sh k07 k13     # yardstick: k07 v7 (levels 0 and 1) and k13
+#   tools/smoke/run.sh k14 k15 k07 k16 k17   # M4: probe, FPNet v2 (CPU, 20 steps), k07 v8 features, eval, submit
+#   (k07 v8 reads the k15 smoke output; k08 / k11 / k13 read older feature names and no longer run on it)
 #   (k08 / k11 read the pre-v7 feature names feats_<set>_s<i> and no longer run on k07 v7 output)
 # Build the notebooks first (python tools/build_kernel.py k07_features2:3 k08_eval2 k09_submit2 k10_pubchem_probe).
 # Data and outputs go to out/smoke/ (gitignored). Kernel steps run with --network none; setup needs internet (rdkit).
@@ -70,13 +72,14 @@ for step in $STEPS; do
         -v "$ROOT/tools/smoke/train_model.py":/t.py:ro -v "$D/model":/kaggle/working "$IMG" \
         bash -c "python /t.py 2>&1 | tail -1; chown -R $U /kaggle/working" ;;
     k07)
+      # k07 v8: FPNet v2 from the k15 smoke output (s0 = v2a; run the k14 and k15 steps first), level 0 only
       for i in 0 1 2; do
         py=$D/k07_s$i.py
         nb "$ROOT/kaggle/k07_features2/build_s$i/casmi26-k07-features2-s$i.ipynb" "$py"
-        sed -i 's/S = search.Searcher(C, P, model=MODEL)/S = search.Searcher(C, P, cfg=search.SearchCfg(ppm_win=4000, ppm_fallback=8000), model=MODEL)/; s/^LEVELS = {0: 300, 1: 1000}/LEVELS = {0: 10, 1: 10}/' "$py"
-        grep -q "ppm_win=4000" "$py" && grep -q "^LEVELS = {0: 10, 1: 10} " "$py" \
+        sed -i 's/S = search.Searcher(C, P, model=MODEL)/S = search.Searcher(C, P, cfg=search.SearchCfg(ppm_win=4000, ppm_fallback=8000), model=MODEL)/; s/^LEVELS = {0: 300}/LEVELS = {0: 10}/' "$py"
+        grep -q "ppm_win=4000" "$py" && grep -q "^LEVELS = {0: 10} " "$py" \
           || { echo "smoke patch did not apply to k07 (source changed?)"; exit 1; }
-        TAIL=2 run_kernel "k07 shard $i" "$py" "$D/k07_s$i" "${IN_DATA[@]}"
+        TAIL=2 run_kernel "k07 shard $i" "$py" "$D/k07_s$i" "${IN_DATA[@]}" -v "$D/k15_s0":/kaggle/input/k15:ro
       done ;;
     k08)
       nb "$ROOT/kaggle/k08_eval2/build/casmi26-k08-eval2.ipynb" "$D/k08.py"
@@ -133,6 +136,44 @@ for step in $STEPS; do
       TAIL=${TAIL:-40} run_kernel k13 "$D/k13.py" "$D/k13" -v "$D/k07_s0":/kaggle/input/s0:ro \
         -v "$D/k07_s1":/kaggle/input/s1:ro -v "$D/k07_s2":/kaggle/input/s2:ro -v "$D/data/pool":/kaggle/input/k05:ro \
         -v "$D/k10":/kaggle/input/k10:ro ;;
+    k14)
+      # offline: rdkit from out/smoke/wheels; wide window so that the tiny pool gives several candidates
+      wheels
+      py=$D/k14.py
+      nb "$ROOT/kaggle/k14_fpnet_probe/build/casmi26-k14-fpnet-probe.ipynb" "$py"
+      sed -i 's/^PPM = 10.0/PPM = 4000.0/; s/^N_BOOT = 2000/N_BOOT = 200/' "$py"
+      grep -q "^PPM = 4000.0" "$py" || { echo "smoke patch did not apply to k14 (source changed?)"; exit 1; }
+      TAIL=${TAIL:-80} run_kernel k14 "$py" "$D/k14" "${WHEELS[@]}" -v "$D/data/work":/kaggle/input/k01:ro \
+        -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/model":/kaggle/input/fpnet:ro ;;
+    k15)
+      # CPU, 40 steps (2 epochs, so the last epoch passes the min_epoch=1 guard of k07 / k17); s0 = v2a, then
+      # s1 = v2b (reads the s0 output); needs the k14 smoke output
+      for i in 0 1; do
+        py=$D/k15_s$i.py
+        nb "$ROOT/kaggle/k15_fpnet2/build_s$i/casmi26-k15-fpnet2-s$i.ipynb" "$py"
+        sed -i 's/^TOTAL_STEPS = None /TOTAL_STEPS = 40 /; s/^N_BOOT = 2000/N_BOOT = 200/' "$py"
+        grep -q "^TOTAL_STEPS = 40 " "$py" || { echo "smoke patch did not apply to k15 (source changed?)"; exit 1; }
+        extra=()
+        [ $i = 1 ] && extra=(-v "$D/k15_s0":/kaggle/input/k15s0:ro)
+        TAIL=${TAIL:-30} run_kernel "k15 s$i" "$py" "$D/k15_s$i" -v "$D/data/work":/kaggle/input/k01:ro \
+          -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k14":/kaggle/input/k14:ro \
+          "${extra[@]}"
+      done ;;
+    k16)
+      # needs the k07 (L0 feature names) and k13 smoke outputs
+      nb "$ROOT/kaggle/k16_eval4/build/casmi26-k16-eval4.ipynb" "$D/k16.py"
+      sed -i 's/^N_BOOT = 2000/N_BOOT = 200/' "$D/k16.py"
+      TAIL=${TAIL:-50} run_kernel k16 "$D/k16.py" "$D/k16" -v "$D/k07_s0":/kaggle/input/s0:ro \
+        -v "$D/k07_s1":/kaggle/input/s1:ro -v "$D/k07_s2":/kaggle/input/s2:ro -v "$D/data/pool":/kaggle/input/k05:ro \
+        -v "$D/k13":/kaggle/input/k13:ro -v "$D/k14":/kaggle/input/k14:ro -v "$D/k15_s0":/kaggle/input/k15:ro ;;
+    k17)
+      # needs the k15 (s0) and k16 smoke outputs; the smoke k16 chooses nothing, so force a routed variant with a mass cut
+      nb "$ROOT/kaggle/k17_submit4/build/casmi26-k17-submit4.ipynb" "$D/k17.py"
+      sed -i 's/^VARIANT = None /VARIANT = "route:soft:2|ppm8.5" /' "$D/k17.py"
+      grep -q '^VARIANT = "route:soft:2|ppm8.5" ' "$D/k17.py" || { echo "smoke patch did not apply to k17"; exit 1; }
+      TAIL=8 run_kernel k17 "$D/k17.py" "$D/k17" "${IN_DATA[@]}" -v "$D/k15_s0":/kaggle/input/k15:ro \
+        -v "$D/k16":/kaggle/input/k16:ro
+      check_sub "$D/k17/submission.csv" ;;
     *) echo "unknown step $step"; exit 1 ;;
   esac
 done

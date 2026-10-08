@@ -37,16 +37,28 @@ class Cfg:
     rank_w = 1.0
     rank_temp = 4.0
     workers = 3
+    # 前処理と timsTOF の印（v2〜。チェックポイントの cfg に入り、推論では FPModel が自分の値を使う）
+    peak_floor = 0.0  # 基準ピークに対する強度の床（キャッシュの 0.1% の上に足す。0 = なし）
+    max_peaks = MAX_PEAKS
+    tims_fixed = None  # None = スペクトルの印のまま、0.0 / 1.0 = 学習でも推論でも常にその値
+    # 学習の抽出（v2〜。既定値は k06 と同じ動き）
+    max_per_struct = 0  # エポックごとに各構造から引くスペクトルの上限（0 = 全部）
+    np_weight = 1  # COCONUT にもある train の構造を 1 エポックに何回分引くか
+    neg_train_only = False  # 順位の損失の負例を、窓の中の train の構造（ホールドアウト以外）からだけ引く
+    total_steps = 0  # > 0 なら、エポック数をこの総ステップ数から決める
 
 
 def adduct_index(a):
     return ADDUCT_IX.get(str(a).replace(" ", ""), ADDUCT_IX["<unk>"])
 
 
-def peak_tokens(mz, it, max_peaks=MAX_PEAKS):
-    """Top-`max_peaks` peaks by intensity, m/z sorted, sqrt(it / max)."""
+def peak_tokens(mz, it, max_peaks=MAX_PEAKS, floor=0.0):
+    """Peaks with it >= floor * max, then the top-`max_peaks` by intensity, m/z sorted, sqrt(it / max)."""
     mz = np.asarray(mz, np.float32)
     it = np.asarray(it, np.float32)
+    if floor > 0 and len(it):
+        k = it >= floor * it.max()
+        mz, it = mz[k], it[k]
     if len(mz) > max_peaks:
         k = np.argpartition(-it, max_peaks - 1)[:max_peaks]
         k.sort()
@@ -73,8 +85,8 @@ def collate(items, max_peaks=MAX_PEAKS):
     return dict(mz=mz, it=it, pad=pad, g=g, ad=ad)
 
 
-def spec_item(mz, it, prec, adduct, mode, ce=np.nan, tims=1.0):
-    m, i = peak_tokens(mz, it)
+def spec_item(mz, it, prec, adduct, mode, ce=np.nan, tims=1.0, floor=0.0, max_peaks=MAX_PEAKS):
+    m, i = peak_tokens(mz, it, max_peaks, floor)
     ce_ok = ce is not None and np.isfinite(ce)
     return dict(mz=m, it=i, prec=float(prec), adduct_ix=adduct_index(adduct), mode=float(mode),
                 ce=float(ce) / 100.0 if ce_ok else 0.0, ce_known=1.0 if ce_ok else 0.0, tims=float(tims))
@@ -136,11 +148,17 @@ def unpack_bits_torch(packed, nbits):
 
 # ---------------------------------------------------------------------------------------------- training data
 class TrainData:
-    """Training spectra = kept train spectra whose structure maps to a pool entry outside the holdout."""
+    """Training spectra = kept train spectra whose structure maps to a pool entry outside the holdout.
+
+    v2 options (Cfg; the defaults reproduce k06): each epoch draws at most `max_per_struct` spectra per structure,
+    structures that are also in COCONUT are drawn `np_weight` times (independent draws), and with `neg_train_only`
+    the in-window negatives come only from train structures outside the holdout (COCONUT-only structures then never
+    appear in training). in_coconut / in_train shape only the training sample here, never a ranking feature."""
 
     def __init__(self, C, P, holdout_pids, frac=1.0, seed=0):
         pid = P.sid2pid[C.sid]
-        ok = C.keep & (pid >= 0) & ~np.isin(pid, np.asarray(list(holdout_pids), np.int64))
+        hold = np.asarray(sorted(holdout_pids), np.int64)
+        ok = C.keep & (pid >= 0) & ~np.isin(pid, hold)
         rows = np.flatnonzero(ok)
         if frac < 1.0:
             rows = np.random.default_rng(seed).choice(rows, int(len(rows) * frac), replace=False)
@@ -150,25 +168,52 @@ class TrainData:
         tims_ids = [C.lib_id[n] for n in TIMS_LIBS if n in C.lib_id]
         self.tims = np.isin(C.lib[rows], tims_ids).astype(np.float32)
         self.adduct = np.array([adduct_index(a) for a in C.adducts], np.int64)[C.adduct[rows]]
+        self.is_np = P.in_coconut[self.pid]
+        self.by_pid = np.argsort(self.pid, kind="mergesort")  # spectra grouped by structure (for per-epoch draws)
         # +-ppm window of every pool entry (for in-window negatives), in the corrected-mass order
         tol = P.mass * Cfg.ppm * 1e-6
-        self.order = P.order
-        self.win_lo = np.searchsorted(P.mass_sorted, P.mass - tol, "left")
-        self.win_hi = np.searchsorted(P.mass_sorted, P.mass + tol, "right")
+        if Cfg.neg_train_only:
+            keep = P.in_train[P.order] & ~np.isin(P.order, hold)
+            self.order = P.order[keep]
+        else:
+            self.order = P.order
+        ms = P.mass[self.order]
+        self.win_lo = np.searchsorted(ms, P.mass - tol, "left")
+        self.win_hi = np.searchsorted(ms, P.mass + tol, "right")
 
     def __len__(self):
         return len(self.rows)
 
+    def epoch_index(self, rng):
+        """Shuffled spectrum indices for one epoch: all spectra (k06), or the capped / NP-weighted draw (v2)."""
+        cap, w = int(Cfg.max_per_struct), int(Cfg.np_weight)
+        if cap <= 0 and w <= 1:
+            return rng.permutation(len(self.rows))
+        parts = []
+        for k in range(max(w, 1)):
+            o = self.by_pid if k == 0 else self.by_pid[self.is_np[self.by_pid]]
+            if cap > 0:
+                o = o[np.lexsort((rng.random(len(o)), self.pid[o]))]  # random order inside each structure
+                p = self.pid[o]
+                first = np.r_[True, p[1:] != p[:-1]]
+                start = np.maximum.accumulate(np.where(first, np.arange(len(o)), 0))
+                o = o[np.arange(len(o)) - start < cap]
+            parts.append(o)
+        idx = np.concatenate(parts)
+        return idx[rng.permutation(len(idx))]
+
     def items(self, idx):
         C = self.C
+        tf = Cfg.tims_fixed
         out = []
         for j in idx:
             r = self.rows[j]
-            m, i = peak_tokens(*C.spectrum(r))
+            m, i = peak_tokens(*C.spectrum(r), Cfg.max_peaks, Cfg.peak_floor)
             ce = float(C.ce[r])
             ok = np.isfinite(ce)
             out.append(dict(mz=m, it=i, prec=float(C.prec[r]), adduct_ix=int(self.adduct[j]), mode=float(C.mode[r]),
-                            ce=ce / 100.0 if ok else 0.0, ce_known=1.0 if ok else 0.0, tims=float(self.tims[j])))
+                            ce=ce / 100.0 if ok else 0.0, ce_known=1.0 if ok else 0.0,
+                            tims=float(self.tims[j]) if tf is None else float(tf)))
         return out
 
     def negatives(self, pids, k, rng):
@@ -181,15 +226,16 @@ class TrainData:
         return neg
 
 
-def _batches(n, batch, rng):
-    o = rng.permutation(n)
-    return [o[i:i + batch] for i in range(0, n - batch + 1, batch)]
+def _batches(o, batch):
+    """Full batches of the (already shuffled) index array o."""
+    return [o[i:i + batch] for i in range(0, len(o) - batch + 1, batch)]
 
 
 # ---------------------------------------------------------------------------------------------- evaluation
 def window_mrr(model_fn, C, P, queries, ppm=10.0, k=25):
     """MRR@k of the truth among pool candidates within +-ppm of the truth's mass, scored by f.z
-    (molecule logits = mean of per-spectrum logits). queries: DataFrame with pid, rows."""
+    (molecule logits = mean of per-spectrum logits). queries: DataFrame with pid, rows.
+    Ties count in the truth's favour (rank = 1 + number of strictly better candidates)."""
     from .harness import query_specs
     rr = []
     for q in queries.itertuples():
@@ -202,8 +248,67 @@ def window_mrr(model_fn, C, P, queries, ppm=10.0, k=25):
     return float(np.mean(rr)) if rr else float("nan")
 
 
+def truth_ranks(s, cand, pid):
+    """Rank of the truth `pid` among candidates `cand` with scores `s` under three tie rules:
+    opt (ties in the truth's favour, as window_mrr), pid (ties by pid, as harness.ranks_of_truth), pess (against)."""
+    t = s[np.flatnonzero(cand == pid)[0]]
+    better, tie = int((s > t).sum()), (s == t) & (cand != pid)
+    return 1 + better, 1 + better + int((tie & (cand < pid)).sum()), 1 + better + int(tie.sum())
+
+
+def window_ranks(Z, P, pids, ppm=10.0):
+    """Ranks of each truth pid among the pool candidates within +-ppm of its mass, scored by f.Z[i].
+    -> DataFrame(n_cand, r_opt, r_pid, r_pess), one row per query (same order as pids)."""
+    import pandas as pd
+    out = []
+    for z, p in zip(Z, pids):
+        cand = P.window(P.mass[p], ppm)
+        s = np.unpackbits(P.fp[cand], axis=1)[:, :len(z)].astype(np.float32) @ z
+        out.append((len(cand), *truth_ranks(s, cand, p)))
+    return pd.DataFrame(out, columns=["n_cand", "r_opt", "r_pid", "r_pess"])
+
+
+TAN_BINS = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 1.01)
+
+
+def provenance_coef(Z, P, pids, holdout, ppm=10.0, n_boot=2000, seed=2):
+    """Does the model score structures that only appear as negatives (COCONUT-only) lower than comparable
+    never-trained structures (holdout train structures)? For every query window (candidates within +-ppm of the
+    truth's mass, truth excluded) the scores f.z are standardised; the result is the weighted mean over bins of the
+    Tanimoto similarity to the truth of mean(z | COCONUT-only) - mean(z | holdout), weights = holdout counts per bin,
+    with a bootstrap over queries. -> dict(est, se, lo, hi, n_co, n_ho) (k14 section 3; used by k15 for v2b)."""
+    from .harness import boot_index, ci
+    pop = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(1)
+    hold = np.asarray(sorted(holdout), np.int64)
+    nb = len(TAN_BINS) - 1
+    S, N = np.zeros((len(pids), 2, nb)), np.zeros((len(pids), 2, nb))
+    for i, (z, p) in enumerate(zip(Z, pids)):
+        c = P.window(P.mass[p], ppm)
+        F = P.fp[c]
+        s = np.unpackbits(F, axis=1)[:, :len(z)].astype(np.float32) @ z
+        if len(s) < 3 or s.std() == 0:
+            continue
+        zz = (s - s.mean()) / s.std()
+        ft = P.fp[p]
+        b = np.clip(np.digitize(pop[F & ft].sum(1) / np.maximum(pop[F | ft].sum(1), 1), TAN_BINS) - 1, 0, nb - 1)
+        for k, m in enumerate([P.in_coconut[c] & ~P.in_train[c], np.isin(c, hold) & (c != p)]):
+            np.add.at(S[i, k], b[m], zz[m])
+            np.add.at(N[i, k], b[m], 1)
+
+    def coef(Ss, Ns):
+        ok = (Ns[..., 0, :] > 0) & (Ns[..., 1, :] > 0)
+        d = np.where(ok, Ss[..., 0, :] / np.maximum(Ns[..., 0, :], 1) - Ss[..., 1, :] / np.maximum(Ns[..., 1, :], 1), 0)
+        w = np.where(ok, Ns[..., 1, :], 0)
+        return (d * w).sum(-1) / np.maximum(w.sum(-1), 1)
+
+    M = np.stack([np.bincount(r, minlength=len(pids)) for r in boot_index(len(pids), n_boot, seed)]).astype(np.float32)
+    out = ci(coef(S.sum(0), N.sum(0)), coef(np.tensordot(M, S, axes=1), np.tensordot(M, N, axes=1)))
+    return dict(out, n_co=int(N[:, 0].sum()), n_ho=int(N[:, 1].sum()))
+
+
 class FPModel:
-    """Inference wrapper: molecule logits z (nbits,) from a list of spectra dicts."""
+    """Inference wrapper: molecule logits z (nbits,) from a list of spectra dicts. The preprocessing and the
+    timsTOF setting come from the checkpoint's cfg (defaults = k06), stored per instance in `prep`."""
 
     def __init__(self, path, device=None):
         import torch
@@ -211,21 +316,52 @@ class FPModel:
         for k, v in ck["cfg"].items():
             setattr(Cfg, k, v)
         self.nbits, self.epoch = ck["nbits"], ck.get("epoch", -1)
+        cfg = ck["cfg"]
+        self.prep = dict(floor=cfg.get("peak_floor", 0.0), max_peaks=cfg.get("max_peaks", MAX_PEAKS),
+                         tims_fixed=cfg.get("tims_fixed"))
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.net = build_model(self.nbits).to(self.device).eval()
         self.net.load_state_dict(ck["model"])
 
-    def __call__(self, specs):
-        import torch
+    def _items(self, specs):
+        p = self.prep
+        tf = p["tims_fixed"]
         items = [spec_item(s["mz"], s["it"], s["prec"], s["adduct"], s["mode"], s.get("ce", np.nan),
-                           s.get("tims", 1.0)) for s in specs]
-        items = [x for x in items if len(x["mz"])]
-        if not items:
-            return np.zeros(self.nbits, np.float32)
+                           s.get("tims", 1.0) if tf is None else tf, p["floor"], p["max_peaks"]) for s in specs]
+        return [x for x in items if len(x["mz"])]
+
+    def _forward(self, items):
+        import torch
         b = {k: torch.as_tensor(v, device=self.device) for k, v in collate(items).items()}
         with torch.no_grad():
-            z = self.net(b["mz"], b["it"], b["pad"], b["g"], b["ad"]).float()
-        return z.mean(0).cpu().numpy()
+            return self.net(b["mz"], b["it"], b["pad"], b["g"], b["ad"]).float().cpu().numpy()
+
+    def __call__(self, specs):
+        items = self._items(specs)
+        if not items:
+            return np.zeros(self.nbits, np.float32)
+        return self._forward(items).mean(0)
+
+    def zs(self, spec_lists, batch=256):
+        """Molecule logits for many molecules at once (spectra batched across molecules, sorted by length).
+        -> (n_molecules, nbits); zeros for a molecule without usable spectra."""
+        items, owner = [], []
+        for i, specs in enumerate(spec_lists):
+            for x in self._items(specs):
+                items.append(x)
+                owner.append(i)
+        owner = np.asarray(owner, np.int64)
+        Z = np.zeros((len(spec_lists), self.nbits), np.float32)
+        if not items:
+            return Z
+        order = np.argsort([len(x["mz"]) for x in items], kind="mergesort")
+        out = np.zeros((len(items), self.nbits), np.float32)
+        for a in range(0, len(order), batch):
+            ix = order[a:a + batch]
+            out[ix] = self._forward([items[j] for j in ix])
+        np.add.at(Z, owner, out)
+        Z /= np.maximum(np.bincount(owner, minlength=len(spec_lists)), 1)[:, None]
+        return Z
 
 
 def load_checked(name="fpnet.pt", min_epoch=10, threads=2):
@@ -244,9 +380,12 @@ def load_checked(name="fpnet.pt", min_epoch=10, threads=2):
 
 # ---------------------------------------------------------------------------------------------- training loop
 def train(C, P, holdout_pids, val_queries, out_path, frac=1.0, epochs=None, budget_secs=10.5 * 3600,
-          extra_val=None, log=print, seed=0, track=None):
-    """Train on all non-holdout spectra; validate (window MRR on val_queries) and checkpoint every epoch.
-    Returns the history list. The best checkpoint (by val MRR) is written to out_path.
+          extra_val=None, log=print, seed=0, track=None, select="best", eval_every=1):
+    """Train on the non-holdout spectra (all of them, or the v2 per-epoch draw); validate (window MRR on
+    val_queries and extra_val) every `eval_every` epochs and on the last one. Returns the history list.
+    select="best": out_path = the best checkpoint by val MRR (k06); select="last": out_path = the last epoch (v2,
+    so that no evaluation set picks the epoch). The latest epoch is always also written to <out>_last.pt.
+    Epochs: Cfg.total_steps > 0 sets them from the epoch size, else `epochs` or Cfg.epochs.
     track: optional casmi26.track.Run; losses every 500 steps and the epoch records are logged to it."""
     import threading
     import queue
@@ -262,8 +401,14 @@ def train(C, P, holdout_pids, val_queries, out_path, frac=1.0, epochs=None, budg
     nbits = chem.FP_BITS
     net = build_model(nbits).to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=Cfg.lr, weight_decay=Cfg.wd)
-    epochs = epochs or Cfg.epochs
-    steps_per_epoch = len(D) // Cfg.batch
+    probe = D.epoch_index(np.random.default_rng(seed + 12345))  # epoch size (the draw sizes are fixed)
+    steps_per_epoch = max(1, len(probe) // Cfg.batch)
+    epochs = math.ceil(Cfg.total_steps / steps_per_epoch) if Cfg.total_steps > 0 else (epochs or Cfg.epochs)
+    log(f"[fpnet] epoch draw: {len(probe):,} of {len(D):,} spectra, NP share {D.is_np[probe].mean():.3f} "
+        f"(all spectra {D.is_np.mean():.3f}); cap {Cfg.max_per_struct}, NP weight {Cfg.np_weight}, "
+        f"negatives from {'train only' if Cfg.neg_train_only else 'the pool'}, tims {Cfg.tims_fixed}, "
+        f"floor {Cfg.peak_floor}, max peaks {Cfg.max_peaks}")
+    del probe
     total = max(1, steps_per_epoch * epochs)
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / Cfg.warmup) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / total))))
@@ -284,7 +429,7 @@ def train(C, P, holdout_pids, val_queries, out_path, frac=1.0, epochs=None, budg
     cfg_dump = {k: getattr(Cfg, k) for k in dir(Cfg) if not k.startswith("_")}
     for ep in range(epochs):
         net.train()
-        batches = _batches(len(D), Cfg.batch, rng)
+        batches = _batches(D.epoch_index(rng), Cfg.batch)
         qb = queue.Queue(maxsize=8)
         # 前処理（Python のピーク切り出し）を複数スレッドで並行させる
         chunks = [batches[i::Cfg.workers] for i in range(Cfg.workers)]
@@ -336,22 +481,29 @@ def train(C, P, holdout_pids, val_queries, out_path, frac=1.0, epochs=None, budg
         net.eval()
         ck = dict(model=net.state_dict(), nbits=nbits, cfg=cfg_dump, epoch=ep)
         torch.save(ck, out_path.replace(".pt", "_last.pt"))
-        wrap = _Wrap(net, dev, nbits)
-        v = window_mrr(wrap, C, P, val_queries)
-        rec = dict(epoch=ep, steps=n, bce=float(s_bce) / max(n, 1), rank=float(s_rank) / max(n, 1), val_mrr=v,
-                   epoch_secs=time.time() - te)
-        if extra_val is not None:
-            for name, qx in extra_val.items():
-                rec[f"{name}_mrr"] = window_mrr(wrap, C, P, qx)
-        hist.append(rec)
-        if v > best:
-            best = v
+        out_of_time = time.time() - t0 > budget_secs
+        if select == "last":
             torch.save(ck, out_path)
+        rec = dict(epoch=ep, steps=n, bce=float(s_bce) / max(n, 1), rank=float(s_rank) / max(n, 1),
+                   epoch_secs=time.time() - te)
+        if (ep + 1) % eval_every == 0 or ep == epochs - 1 or out_of_time:
+            wrap = _Wrap(net, dev, nbits)
+            rec["val_mrr"] = v = window_mrr(wrap, C, P, val_queries)
+            if extra_val is not None:
+                for name, qx in extra_val.items():
+                    rec[f"{name}_mrr"] = window_mrr(wrap, C, P, qx)
+            if select == "best" and v > best:
+                best = v
+                torch.save(ck, out_path)
+        hist.append(rec)
         if track is not None:
             track.log({f"epoch/{k}": x for k, x in rec.items()}, step=gstep)
-            track.summary({"best_val_mrr": best, "best_epoch": max(hist, key=lambda r: r["val_mrr"])["epoch"]})
+            ev = [r for r in hist if "val_mrr" in r]
+            if ev:
+                track.summary({"best_val_mrr": max(r["val_mrr"] for r in ev),
+                               "best_epoch": max(ev, key=lambda r: r["val_mrr"])["epoch"]})
         log(f"[fpnet] epoch {ep}: {rec} ({time.time() - t0:.0f}s)")
-        if time.time() - t0 > budget_secs:
+        if out_of_time:
             log("[fpnet] time budget reached")
             break
     return hist
@@ -362,5 +514,9 @@ class _Wrap:
 
     def __init__(self, net, device, nbits):
         self.net, self.device, self.nbits = net, device, nbits
+        self.prep = dict(floor=Cfg.peak_floor, max_peaks=Cfg.max_peaks, tims_fixed=Cfg.tims_fixed)
 
+    _items = FPModel._items
+    _forward = FPModel._forward
     __call__ = FPModel.__call__
+    zs = FPModel.zs
