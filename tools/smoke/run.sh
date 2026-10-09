@@ -207,6 +207,60 @@ for step in $STEPS; do
       TAIL=${TAIL:-50} run_kernel k20 "$py" "$D/k20" -v "$D/data/work":/kaggle/input/k01:ro \
         -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k14":/kaggle/input/k14:ro \
         -v "$D/k15_s0":/kaggle/input/k15:ro ;;
+    k21)
+      # M5 P1 fragment table of the smoke pool (offline rdkit from out/smoke/wheels)
+      wheels
+      nb "$ROOT/kaggle/k21_frag/build/casmi26-k21-frag.ipynb" "$D/k21.py"
+      TAIL=${TAIL:-8} run_kernel k21 "$D/k21.py" "$D/k21" "${WHEELS[@]}" -v "$D/data/pool":/kaggle/input/k05:ro ;;
+    k22)
+      # M5 P1 features: 4 shards, wide window and a cut of 10 as in the k07 smoke; needs the k15 (s0), k20, k21 and
+      # k25 smoke outputs; rdkit from out/ds_wheels (the casmi26-wheels dataset); 20 public-test molecules for the timing
+      for i in 0 1 2 3; do
+        py=$D/k22_s$i.py
+        nb "$ROOT/kaggle/k22_features3/build_s$i/casmi26-k22-features3-s$i.ipynb" "$py"
+        sed -i 's/^SEARCH_CFG = search.SearchCfg() /SEARCH_CFG = search.SearchCfg(ppm_win=4000, ppm_fallback=8000) /; s/^MAX_CAND_TRAIN = 300/MAX_CAND_TRAIN = 10/; s/^N_TEST = 400 /N_TEST = 20 /; s/^REQUIRE_CUDA = True /REQUIRE_CUDA = False /' "$py"
+        grep -q "^SEARCH_CFG = search.SearchCfg(ppm_win=4000" "$py" && grep -q "^MAX_CAND_TRAIN = 10" "$py" \
+          || { echo "smoke patch did not apply to k22 (source changed?)"; exit 1; }
+        TAIL=3 run_kernel "k22 shard $i" "$py" "$D/k22_s$i" "${IN_DATA[@]}" -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro \
+          -v "$D/k15_s0":/kaggle/input/k15:ro \
+          -v "$D/k20":/kaggle/input/k20:ro -v "$D/k21":/kaggle/input/k21:ro -v "$D/k25":/kaggle/input/k25:ro
+      done ;;
+    k23)
+      # M5 P1 evaluation on the k22 smoke output (v2a FPNet); k07 smoke output for the check; k13 smoke ranks as M2.2
+      nb "$ROOT/kaggle/k23_eval5/build/casmi26-k23-eval5.ipynb" "$D/k23.py"
+      sed -i 's/^N_BOOT = 2000/N_BOOT = 200/; s/^EXPECT_VARIANT = "v2b"/EXPECT_VARIANT = "v2a"/; s/^REF_TOL = 0.005 /REF_TOL = None /' "$D/k23.py"
+      grep -q '^EXPECT_VARIANT = "v2a"' "$D/k23.py" || { echo "smoke patch did not apply to k23"; exit 1; }
+      TAIL=${TAIL:-60} run_kernel k23 "$D/k23.py" "$D/k23" -v "$D/k22_s0":/kaggle/input/k22s0:ro \
+        -v "$D/k22_s1":/kaggle/input/k22s1:ro -v "$D/k22_s2":/kaggle/input/k22s2:ro -v "$D/k22_s3":/kaggle/input/k22s3:ro \
+        -v "$D/k07_s0":/kaggle/input/s0:ro -v "$D/k07_s1":/kaggle/input/s1:ro -v "$D/k07_s2":/kaggle/input/s2:ro \
+        -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/k13":/kaggle/input/k13:ro ;;
+    k24)
+      # M5 P1 submission: the k23 smoke choice (M2.2, no generation), then forced generation on the M2.2 base
+      # (gen ranker) and on a new pool base (comb); rdkit from out/smoke/wheels as the casmi26-wheels dataset
+      nb "$ROOT/kaggle/k24_submit5/build/casmi26-k24-submit5.ipynb" "$D/k24.py"
+      for v in none m22gen newgen; do
+        py=$D/k24_$v.py
+        cp "$D/k24.py" "$py"
+        case $v in
+          m22gen) sed -i 's/^CHOSEN = None /CHOSEN = dict(kind="gen", base="M2.2", slots=[3, 6, 9, 12, 15, 18, 21, 24], gate=0.7, score="rk") /' "$py" ;;
+          newgen) sed -i 's/^CHOSEN = None /CHOSEN = dict(kind="gen", base="both|hybm:0.7:2", fcols="both", variant="hybm:0.7:2", slots=[5, 10, 15, 20, 25], gate=0.7, score="comb") /' "$py" ;;
+        esac
+        [ $v = none ] || grep -q '^CHOSEN = dict(' "$py" || { echo "smoke patch did not apply to k24"; exit 1; }
+        TAIL=4 run_kernel "k24 $v" "$py" "$D/k24_$v" "${IN_DATA[@]}" -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro \
+          -v "$D/k08":/kaggle/input/k08:ro -v "$D/k15_s0":/kaggle/input/k15:ro -v "$D/k20":/kaggle/input/k20:ro \
+          -v "$D/k21":/kaggle/input/k21:ro -v "$D/k23":/kaggle/input/k23:ro -v "$D/k25":/kaggle/input/k25:ro
+        check_sub "$D/k24_$v/submission.csv"
+      done ;;
+    k25)
+      # M5 P1 fwd v2: CPU, 20 steps x 16 spectra from the k20 smoke fwd.pt; wide window as in k20 (agreement off)
+      py=$D/k25.py
+      nb "$ROOT/kaggle/k25_fwd2/build/casmi26-k25-fwd2.ipynb" "$py"
+      sed -i 's/^STEPS, BATCH, K_NEG, TEMP, LR = 30000, 128,/STEPS, BATCH, K_NEG, TEMP, LR = 20, 16,/; s/^PPM = 10.0/PPM = 4000.0/; s/^N_BOOT = 2000/N_BOOT = 200/; s/^FPNET_VARIANT = "v2b"/FPNET_VARIANT = "v2a"/; s/^N_VAL = 300/N_VAL = 20/; s/^MIN_AGREE = 0.98 /MIN_AGREE = 0.0 /' "$py"
+      grep -q "^STEPS, BATCH, K_NEG, TEMP, LR = 20, 16," "$py" && grep -q "^MIN_AGREE = 0.0 " "$py" \
+        || { echo "smoke patch did not apply to k25 (source changed?)"; exit 1; }
+      TAIL=${TAIL:-40} run_kernel k25 "$py" "$D/k25" -v "$D/data/work":/kaggle/input/k01:ro \
+        -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k14":/kaggle/input/k14:ro \
+        -v "$D/k15_s0":/kaggle/input/k15:ro -v "$D/k20":/kaggle/input/k20:ro ;;
     *) echo "unknown step $step"; exit 1 ;;
   esac
 done

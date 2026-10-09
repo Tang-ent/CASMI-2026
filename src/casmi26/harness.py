@@ -151,17 +151,22 @@ def test_specs(g):
 TRAIN_SETS = ("R1", "R2")
 
 
-def run_queries(searcher, queries, log=print, max_cand_train=300, keep_rule=None):
+def run_queries(searcher, queries, log=print, max_cand_train=300, keep_rule=None, after=None):
     """Feature rows for every query. For training sets (R1/R2), candidates are cut to the top `max_cand_train`
     by `keep_rule` (the truth is always kept). keep_rule(X) returns one score array or a list of them; with a list
-    the union of each score's top `max_cand_train` is kept. -> (features with qid/pid/label, per-query info)."""
+    the union of each score's top `max_cand_train` is kept. -> (features with qid/pid/label, per-query info).
+    after(q, specs, cand, X, info): optional, called right after each query's features (before the cut; M5 k22 uses
+    it to generate class-3 candidates from searcher.last)."""
     from .search import FEATURES
     C = searcher.C
     parts, infos = [], []
     t0 = time.time()
     for i, q in enumerate(queries.itertuples()):
-        cand, X, info = searcher.features(query_specs(C, q.rows), dict(hide_lib=q.hide_lib, hide_pid=q.hide_pid,
-                                                                         hide_pid_lib=q.hide_pid_lib))
+        specs = query_specs(C, q.rows)
+        cand, X, info = searcher.features(specs, dict(hide_lib=q.hide_lib, hide_pid=q.hide_pid,
+                                                      hide_pid_lib=q.hide_pid_lib))
+        if after is not None:
+            after(q, specs, cand, X, info)
         label = (cand == q.pid).astype(np.int8)
         if q.set in TRAIN_SETS and keep_rule is not None and len(cand) > max_cand_train:
             scores = keep_rule(X)
@@ -170,7 +175,7 @@ def run_queries(searcher, queries, log=print, max_cand_train=300, keep_rule=None
                 sel[np.argsort(-sc, kind="mergesort")[:max_cand_train]] = True
             sel |= label > 0
             cand, X, label = cand[sel], X[sel], label[sel]
-        df = pd.DataFrame(X, columns=FEATURES)
+        df = pd.DataFrame(X, columns=getattr(searcher, "feature_names", FEATURES))
         df.insert(0, "label", label)
         df.insert(0, "pid", cand.astype(np.int32))
         df.insert(0, "qid", np.int32(q.qid))

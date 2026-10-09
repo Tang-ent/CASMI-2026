@@ -144,9 +144,8 @@ class FwdModel:
                 for a in range(0, n, chunk):
                     f = unpack_bits_torch(fp[a:a + chunk], chem.FP_BITS)
                     m = len(f)
-                    with torch.autocast("cuda", dtype=torch.float16, enabled=self.device == "cuda"):
-                        p = self.net(f, c.expand(m, -1), torch.full((m,), pb, device=self.device, dtype=torch.long))
-                    p = p.float()
+                    # 推論は fp32（k22 の GPU と k24 の CPU で同じ値にする。k20 / k25 の評価は fp16 だった）
+                    p = self.net(f, c.expand(m, -1), torch.full((m,), pb, device=self.device, dtype=torch.long))
                     out[a:a + m] += ((p @ q) / (p.norm(dim=-1) + 1e-8)).cpu().numpy()
         return out / len(qs)
 
@@ -285,4 +284,129 @@ def train(C, D, P, out_path, val=None, budget_secs=6 * 3600, log=print, seed=0, 
         if out_of_time:
             log("[fwd] time budget reached")
             break
+    return hist
+
+
+# ---------------------------------------------------------------------------------------------- v2 (M5 P1, k25_fwd2)
+def _batch(C, D, adducts, idx):
+    """(pids, cond, precursor bins, target bins, target vals) of the training spectra D.rows[idx]."""
+    rows = D.rows[idx]
+    bl, vl = [], []
+    for r in rows:
+        b, v = bin_peaks(*C.spectrum(r))
+        bl.append(b)
+        vl.append(v)
+    L = max(1, max(len(b) for b in bl))
+    bins = np.zeros((len(idx), L), np.int64)
+    vals = np.zeros((len(idx), L), np.float32)
+    for i, (b, v) in enumerate(zip(bl, vl)):
+        bins[i, :len(b)] = b
+        vals[i, :len(v)] = v
+    cond = np.stack([cond_row(adducts[j], C.mode[r], C.ce[r]) for j, r in zip(idx, rows)])
+    pb = np.array([prec_bin(C.prec[r]) for r in rows], np.int64)
+    return D.pid[idx], cond, pb, bins, vals
+
+
+def train_rank(C, D, P, init_path, out_path, steps=30000, batch=128, k_neg=16, temp=0.05, lr=1e-4, warmup=500,
+               budget_secs=3 * 3600, val=None, eval_every=5000, log=print, seed=0, track=None):
+    """fwd v2: fine-tune a fwd checkpoint with (1 - cosine) + an in-window softmax over the truth and k_neg pool
+    structures from the truth's +-10 ppm window (D.negatives; fpnet.Cfg.neg_train_only decides train-only), scored by
+    the cosine between each structure's predicted spectrum and the training spectrum (temperature temp). The last step
+    is written to out_path. val: dict name -> queries; window MRR of fwd alone every eval_every steps (display)."""
+    import queue
+    import threading
+
+    import torch
+    import torch.nn.functional as F
+    from .harness import rr_of
+
+    t0 = time.time()
+    torch.manual_seed(seed)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    ck = torch.load(init_path, map_location="cpu", weights_only=False)
+    for k, v in ck["cfg"].items():
+        setattr(Cfg, k, v)
+    net = build_model().to(dev)
+    net.load_state_dict(ck["model"])
+    opt = torch.optim.AdamW(net.parameters(), lr=lr, weight_decay=Cfg.wd)
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, lambda s: min(1.0, (s + 1) / warmup) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / steps))))
+    scaler = torch.amp.GradScaler("cuda", enabled=dev == "cuda")
+    fp_gpu = torch.as_tensor(P.fp, device=dev)
+    adducts = np.asarray(D.adduct)
+    rng = np.random.default_rng(seed)
+    order = []
+    while sum(len(o) for o in order) < steps * batch:
+        order.append(D.epoch_index(rng))
+    order = np.concatenate(order)[:steps * batch]
+    batches = [order[i:i + batch] for i in range(0, len(order), batch)]
+    log(f"[fwd2] init {init_path} (epoch {ck.get('epoch')}), {steps:,} steps x {batch} spectra x (1 + {k_neg}) "
+        f"structures, temp {temp}, lr {lr}, device {dev}")
+
+    def producer(bs, qout, seed_):
+        prng = np.random.default_rng(seed_)
+        for idx in bs:
+            pids, cond, pb, bins, vals = _batch(C, D, adducts, idx)
+            qout.put((pids, cond, pb, bins, vals, D.negatives(pids, k_neg, prng)))
+        qout.put(None)
+
+    qb = queue.Queue(maxsize=16)
+    threads = [threading.Thread(target=producer, args=(batches[i::Cfg.workers], qb, seed * 1000 + i), daemon=True)
+               for i in range(Cfg.workers)]
+    for th in threads:
+        th.start()
+    hist, done, n, te = [], 0, 0, time.time()
+    s_reg, s_rank = torch.zeros((), device=dev), torch.zeros((), device=dev)
+    kk = 1 + k_neg
+    cfg_dump = {k: getattr(Cfg, k) for k in dir(Cfg) if not k.startswith("_")}
+    net.train()
+    while done < len(threads):
+        item = qb.get()
+        if item is None:
+            done += 1
+            continue
+        if time.time() - t0 > budget_secs or n >= steps:
+            continue  # 残りを捨てる（生産者を止めずに流し切る）
+        pids, cond, pb, bins, vals, neg = (torch.as_tensor(x).to(dev, non_blocking=True) for x in item)
+        cand = torch.cat([pids[:, None], neg], 1)                                  # (B, 1 + K)
+        valid = cand >= 0
+        fp = unpack_bits_torch(fp_gpu[cand.clamp(min=0).reshape(-1)], chem.FP_BITS)
+        with torch.autocast("cuda", dtype=torch.float16, enabled=dev == "cuda"):
+            pred = net(fp, cond.repeat_interleave(kk, 0), pb.repeat_interleave(kk, 0))
+        pred = pred.float().view(len(pids), kk, NB)
+        t = torch.zeros(len(pids), NB, device=dev).scatter_(1, bins, vals)
+        cos = (pred * t[:, None, :]).sum(-1) / (pred.norm(dim=-1) * t.norm(dim=-1)[:, None] + 1e-8)
+        reg = 1 - cos[:, 0].mean()
+        rank = F.cross_entropy((cos / temp).masked_fill(~valid, -1e4),
+                               torch.zeros(len(pids), dtype=torch.long, device=dev))
+        loss = reg + rank
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        scaler.step(opt)
+        scaler.update()
+        sched.step()
+        n += 1
+        s_reg += reg.detach()
+        s_rank += rank.detach()
+        if n % 500 == 0:
+            rec = dict(step=n, reg=float(s_reg) / 500, rank=float(s_rank) / 500, s_per_step=(time.time() - te) / 500)
+            s_reg.zero_()
+            s_rank.zero_()
+            te = time.time()
+            if val and (n % eval_every == 0 or n == steps):
+                net.eval()
+                m = FwdModel(net=net, device=dev)
+                for name, qx in val.items():
+                    rec[f"{name}_mrr"] = float(rr_of(window_ranks(m, C, P, qx)["fwd"]).mean())
+                net.train()
+            hist.append(rec)
+            log(f"  [fwd2] {rec} ({time.time() - t0:.0f}s)")
+            if track is not None:
+                track.log({f"fwd2/{k}": v for k, v in rec.items()}, step=n)
+    net.eval()
+    torch.save(dict(model=net.state_dict(), cfg=cfg_dump, epoch=n, nb=NB, bin=BIN, variant="v2", init=init_path,
+                    temp=temp, k_neg=k_neg), out_path)
+    log(f"[fwd2] {n} steps done ({time.time() - t0:.0f}s){' — time budget reached' if n < steps else ''}")
     return hist

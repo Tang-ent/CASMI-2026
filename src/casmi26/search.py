@@ -29,6 +29,7 @@ FEATURES = [
 ]
 FZ_FEATURES = ["fz", "fz_z", "fz_rank", "fz_gap", "fz_soft", "fz_grp_gap2"]
 PRIOR_FEATURES = ["cand_nspec", "cand_nlib"]
+FWD_FEATURES = ["fwd", "fwd_z", "fwd_rank"]  # 構造→スペクトルの予測器（M5 P1-3。Searcher に fwd を渡したときだけ）
 COL = {n: i for i, n in enumerate(FEATURES)}
 
 
@@ -60,14 +61,24 @@ def rank_norm(x):
     return (r / (n - 1)).astype(np.float32)
 
 
+def _zs(x):
+    sd = x.std() if len(x) else 0.0
+    return (x - x.mean()) / sd if sd > 1e-9 else np.zeros_like(x)
+
+
 def _unpack(fp_packed):
     return np.unpackbits(fp_packed, axis=1)[:, :chem.FP_BITS].astype(np.float32)
 
 
 class Searcher:
-    def __init__(self, cache, pool=None, cfg=None, sim=SimCfg, model=None):
+    def __init__(self, cache, pool=None, cfg=None, sim=SimCfg, model=None, fwd=None, frag=None):
         self.C = cache
         self.model = model  # fpnet.FPModel or None
+        # M5 P1: fwd = fwd.FwdModel、frag = frag.FragTable。渡したときだけ FEATURES の後ろに列を足す（渡さなければ今までと同じ）
+        from .frag import FRAG_FEATURES
+        self.fwd, self.frag = fwd, frag
+        self.feature_names = FEATURES + (FRAG_FEATURES if frag is not None else []) + \
+            (FWD_FEATURES if fwd is not None else [])
         self.P = pool if pool is not None else Pool(cache=cache)
         self.cfg = cfg or SearchCfg()
         self.sim = sim
@@ -119,7 +130,7 @@ class Searcher:
                          z=None)
         specs = [s for s in specs if np.isfinite(chem.neutral_mass(s["prec"], s["adduct"]))][:cfg.max_query_spectra]
         target = self.target_mass(specs)
-        empty = (np.zeros(0, np.int64), np.zeros((0, len(FEATURES)), np.float32),
+        empty = (np.zeros(0, np.int64), np.zeros((0, len(self.feature_names)), np.float32),
                  dict(target=target, n_cand=0, ppm=np.nan, lib_max=0.0, secs=0.0))
         if not np.isfinite(target):
             return empty
@@ -257,6 +268,16 @@ class Searcher:
         X[:, COL["n_pos"]] = sum(1 for s in specs if s["mode"] > 0)
         X[:, COL["n_neg"]] = sum(1 for s in specs if s["mode"] < 0)
         X[:, COL["target_mass"]] = target / 1000.0
+        extra = []
+        if self.frag is not None:
+            from .frag import match_features
+            expl, top10 = match_features(specs, *self.frag.csr(cand))
+            extra.append(np.c_[expl, top10, _zs(expl), rank_norm(expl)])
+        if self.fwd is not None:
+            fw = self.fwd.score(specs, P.fp[cand])
+            extra.append(np.c_[fw, _zs(fw), rank_norm(fw)])
+        if extra:
+            X = np.hstack([X] + extra).astype(np.float32)
         info = dict(target=target, n_cand=nc, ppm=ppm, lib_max=gmax, top_sim=top_sim, secs=time.time() - t0)
         return cand.astype(np.int64), X, info
 
