@@ -15,6 +15,13 @@
 # 追加の道（2026-10-07、k16 v2 の結果を見る前にユーザーと決定）: B_N は 85% が timsTOF 以外の装置なので、timsTOF の
 #   天然物だけに効く伸び（k14: tims=0 で A の fz +0.08）が見えない。A の非劣性に加えて、B_A の対の差の下限 > 0 かつ
 #   B_N の下限 > −0.02 のものも合格にする（予測 LB の式はそのまま）。
+# v3（2026-10-09）: v2 で、fz だけの B_N は変わらないのにランカーを通すと B_N が −0.018 下がった原因を調べる。
+#   - 診断（表示だけ）: k13（古い特徴量）の同じ名前のモデル（gate:0.9 / fz / lgb_R / hybm:0.7:2）と対で比べ、
+#     B_N はクエリのライブラリ別にも分ける。gate:0.9 は FPNet を使わないので、A / B_A / C / V の順位は一致するはず。
+#     k13 の古いランカーを新しい特徴量に当てた hybm（R1 / R2 は古いランカーの学習に使われたので、比べるのは
+#     A / B_A / C / V だけ）、fz の特徴量を抜いたランカーの hybm も出す。
+#   - 新しい候補 hybmT:τ:w: ランカーに「クエリが timsTOF か」（q_tims、テストではすべて 1）を足す。装置ごとに
+#     fz をどこまで信じるかを学べるようにする。選び方は v2 と同じ。
 
 # %%
 import glob
@@ -88,6 +95,40 @@ for s in ["A", "B_A", "C", "B_C", "V"]:
 del R, oof
 print(f"lgb_R done ({time.time() - T0:.0f}s)")
 
+# v3: 診断用と候補用のランカー
+q_tims = infos.set_index("qid").qlib.isin(harness.TIMS_LIBS).astype(np.float32)
+for s in SETS:
+    feats[s]["q_tims"] = q_tims.reindex(feats[s].qid.values).values
+print("q_tims share:", {s: round(float(q_tims.reindex(qids_of[s]).mean()), 3) for s in SETS})
+
+
+def ranker(features, tag, save=False):
+    """lgb_R on other feature lists: R1 / R2 out-of-fold, the other sets = mean of 3 seeds."""
+    R_ = pd.concat([feats["R1"], feats["R2"]], ignore_index=True)
+    oof_ = rank.cv_oof(R_, features, n_folds=5, groups=truth)
+    ms = [rank.fit(R_, features, seed=sd) for sd in SEEDS]
+    if save:
+        for i, mdl in enumerate(ms):
+            mdl.save_model(f"{OUT}/ranker_{tag}_{i}.txt")
+    r1 = R_.qid.isin(feats["R1"].qid.unique()).values
+    out = {"R1": oof_[r1], "R2": oof_[~r1]}
+    for s_ in ["A", "B_A", "C", "B_C", "V"]:
+        out[s_] = rank.predict(ms, feats[s_][features].values.astype(np.float32))
+    print(f"ranker {tag} done ({time.time() - T0:.0f}s)")
+    return out
+
+
+FL_T = FL + ["q_tims"]
+RK_T = ranker(FL_T, "lgb_RT", save=True)
+RK_N = ranker([f for f in FL if f not in search.FZ_FEATURES], "lgb_R_noFZ")
+old_rk = sorted(glob.glob("/kaggle/input/**/ranker_L0_lgb_R_*.txt", recursive=True))
+RK_OLD = None
+if len(old_rk) == 3:
+    import lightgbm as lgb
+    old_models = [lgb.Booster(model_file=p) for p in old_rk]
+    RK_OLD = {s: rank.predict(old_models, X[s].astype(np.float32)) for s in SETS}  # R1 / R2 は学習に使われた
+    print("k13 rankers applied to the new features:", [os.path.basename(p) for p in old_rk])
+
 # %% [markdown]
 # ## 振り分け器（クラス1か）
 
@@ -152,9 +193,21 @@ for w in ROUTE_WS:
                                                                qid=feats[s].qid.values) for s in SETS}
     scores[f"route:soft:{w}"] = {s: search.route_score(X[s], RK[s], P_ROW[s], w, "soft", qid=feats[s].qid.values)
                                  for s in SETS}
+for tau in BLEND_TAUS:
+    for w in BLEND_WS:
+        scores[f"hybmT:{tau}:{w}"] = {s: search.blend_score(X[s], tau, RK_T[s], w, qid=feats[s].qid.values)
+                                      for s in SETS}
+DISPLAY = {"rule:gate:0.9": {s: search.rule_score(X[s], "gate:0.9") for s in SETS},
+           "rule:fz": {s: search.rule_score(X[s], "fz") for s in SETS},
+           "lgb_R": RK, "lgb_RT": RK_T, "lgb_R_noFZ": RK_N,
+           "hybm_noFZ:0.7:2": {s: search.blend_score(X[s], 0.7, RK_N[s], 2, qid=feats[s].qid.values) for s in SETS}}
+if RK_OLD is not None:
+    DISPLAY["hybm_oldrk:0.7:2"] = {s: search.blend_score(X[s], 0.7, RK_OLD[s], 2, qid=feats[s].qid.values)
+                                   for s in SETS}
+scores.update(DISPLAY)
 rank_rows = []
 for name, sc in scores.items():
-    for cut in PPM_CUTS:
+    for cut in (PPM_CUTS if name.split(":")[0] in ("hyb", "hybm", "route") else (None,)):
         mname = name if cut is None else f"{name}|ppm{cut:g}"
         for s in SETS:
             f = feats[s]
@@ -217,7 +270,8 @@ dd = summ.set_index(["model", "set"])
 rule = pd.DataFrame([dict(model=m, A=dd.loc[(m, "A"), "mrr"], dA=dd.loc[(m, "A"), "d_ref"], dA_lo=dd.loc[(m, "A"), "d_lo"],
                           B_A=dd.loc[(m, "B_A"), "mrr"], dB_A=dd.loc[(m, "B_A"), "d_ref"],
                           dB_A_lo=dd.loc[(m, "B_A"), "d_lo"], B_N=dd.loc[(m, "B_N"), "mrr"], dB_N=dd.loc[(m, "B_N"), "d_ref"],
-                          dB_N_lo=dd.loc[(m, "B_N"), "d_lo"], dB_N_hi=dd.loc[(m, "B_N"), "d_hi"]) for m in RR])
+                          dB_N_lo=dd.loc[(m, "B_N"), "d_lo"], dB_N_hi=dd.loc[(m, "B_N"), "d_hi"])
+                     for m in RR if m not in DISPLAY])
 rule["A_noninferior"] = rule.dA_lo > -NI_MARGIN
 rule["B_N_better"] = rule.dB_N_lo > 0
 rule["B_A_path"] = (rule.dB_A_lo > 0) & (rule.dB_N_lo > -NI_MARGIN)  # timsTOF の天然物側の伸び
@@ -238,6 +292,45 @@ res = dict(features=FEATS_TAG, n_eligible=int(len(el)), chosen=chosen, ref=REF,
            rule=dict(ni_margin=NI_MARGIN, s1=S1, s2=S2))
 json.dump(res, open(f"{OUT}/chosen.json", "w"), indent=1, default=float)
 print("\nCHOSEN:", chosen["model"] if chosen else "none — keep M2.2", f"({len(el)} eligible)")
+
+# %% [markdown]
+# ## 診断（表示だけ）: 古い特徴量（k13）の同じ名前のモデルとの対の差。B_N はクエリのライブラリ別にも
+
+# %%
+k13 = pd.read_parquet(paths.find("ranks.parquet", roots=["/kaggle/input"]))
+qlib = infos.set_index("qid").qlib
+bn_q = np.concatenate([qids_of[s][m] for s, m in B_N])
+PAIRS = [("rule:gate:0.9", "L0|rule:gate:0.9"), ("rule:fz", "L0|rule:fz"), ("lgb_R", "L0|lgb_R"),
+         ("hybm:0.7:2", REF), ("hybmT:0.7:2", REF), ("hybm_noFZ:0.7:2", REF), ("hybm_oldrk:0.7:2", REF)]
+diag, bylib = [], []
+for new_m, old_m in PAIRS:
+    if new_m not in RR:
+        continue
+    g_old = k13[k13.model == old_m]
+    if g_old.empty:
+        continue
+    ro, rn = rr_of_model(g_old), RR[new_m]
+    # hybm_oldrk: k13 の古いランカーは R1 / R2 で学習したので、R2 と B_N（R2 を含む）では比べない
+    for s in (["A", "B_A", "C", "V"] if new_m == "hybm_oldrk:0.7:2" else ["A", "B_A", "C", "V", "R2", "B_N"]):
+        same = None
+        if s in SETS:
+            a = g_old[g_old.set == s].set_index("qid")["rank"].reindex(qids_of[s]).values
+            b = ranks[(ranks.model == new_m) & (ranks.set == s)].set_index("qid")["rank"].reindex(qids_of[s]).values
+            same = float((a == b).mean())
+        diag.append(dict(new=new_m, old=old_m, set=s, old_mrr=ro[s].mean(), new_mrr=rn[s].mean(), same_rank=same,
+                         **harness.paired_ci(rn[s], ro[s], N_BOOT, seed=3)))
+    if new_m == "hybm_oldrk:0.7:2":
+        continue
+    d = pd.DataFrame({"lib": qlib.reindex(bn_q).values, "diff": rn["B_N"] - ro["B_N"]})
+    for lib, g in d.groupby("lib"):
+        bylib.append(dict(new=new_m, old=old_m, lib=lib, n=len(g), mean_diff=g["diff"].mean()))
+diag, bylib = pd.DataFrame(diag), pd.DataFrame(bylib)
+diag.to_csv(f"{OUT}/diag_old_vs_new.csv", index=False)
+with pd.option_context("display.width", 250):
+    print(diag.round(4).to_string(index=False))
+    print("\nB_N difference by query library (new - old):")
+    print(bylib.pivot(index="lib", columns="new", values="mean_diff").round(4).to_string())
+    print(bylib.drop_duplicates("lib").set_index("lib").n.to_string())
 
 # %% [markdown]
 # ## 参考: fz だけの窓内 MRR を、FPNet v2 と「今の重みで tims=0 にしただけ」で比べる（表示だけ）

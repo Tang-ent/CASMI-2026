@@ -169,8 +169,9 @@ for step in $STEPS; do
     k17)
       # needs the k15 (s0) and k16 smoke outputs; the smoke k16 chooses nothing, so force a routed variant with a mass cut
       nb "$ROOT/kaggle/k17_submit4/build/casmi26-k17-submit4.ipynb" "$D/k17.py"
+      # k17 keeps an explicitly set VARIANT; otherwise force one (the smoke k16 chooses nothing)
       sed -i 's/^VARIANT = None /VARIANT = "route:soft:2|ppm8.5" /' "$D/k17.py"
-      grep -q '^VARIANT = "route:soft:2|ppm8.5" ' "$D/k17.py" || { echo "smoke patch did not apply to k17"; exit 1; }
+      grep -q '^VARIANT = "' "$D/k17.py" || { echo "smoke patch did not apply to k17"; exit 1; }
       TAIL=8 run_kernel k17 "$D/k17.py" "$D/k17" "${IN_DATA[@]}" -v "$D/k15_s0":/kaggle/input/k15:ro \
         -v "$D/k16":/kaggle/input/k16:ro
       check_sub "$D/k17/submission.csv" ;;
