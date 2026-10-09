@@ -6,6 +6,7 @@
 #   tools/smoke/run.sh k05p; PC=1 tools/smoke/run.sh k07 k13     # yardstick: k07 v7 (levels 0 and 1) and k13
 #   tools/smoke/run.sh k14 k15 k07 k16 k17   # M4: probe, FPNet v2 (CPU, 20 steps), k07 v8 features, eval, submit
 #   (k07 v8 reads the k15 smoke output; k08 / k11 / k13 read older feature names and no longer run on it)
+#   tools/smoke/run.sh k18 k19 k20           # M5 probes (after k14 k15 k07): isomer ceiling, generation, forward model
 #   (k08 / k11 read the pre-v7 feature names feats_<set>_s<i> and no longer run on k07 v7 output)
 # Build the notebooks first (python tools/build_kernel.py k07_features2:3 k08_eval2 k09_submit2 k10_pubchem_probe).
 # Data and outputs go to out/smoke/ (gitignored). Kernel steps run with --network none; setup needs internet (rdkit).
@@ -175,6 +176,37 @@ for step in $STEPS; do
       TAIL=8 run_kernel k17 "$D/k17.py" "$D/k17" "${IN_DATA[@]}" -v "$D/k15_s0":/kaggle/input/k15:ro \
         -v "$D/k16":/kaggle/input/k16:ro
       check_sub "$D/k17/submission.csv" ;;
+    k18)
+      # M5 isomer probe on the k07 smoke output (v2a FPNet, 4000 ppm windows); no k16 v2 reference check
+      py=$D/k18.py
+      nb "$ROOT/kaggle/k18_isomer_probe/build/casmi26-k18-isomer-probe.ipynb" "$py"
+      sed -i 's/^N_BOOT = 2000/N_BOOT = 200/; s/^PPM = 10.0 /PPM = 4000.0 /; s/^EXPECT_VARIANT = "v2b"/EXPECT_VARIANT = "v2a"/; s/^REF_TOL = 0.005 /REF_TOL = None /' "$py"
+      grep -q "^REF_TOL = None " "$py" && grep -q '^EXPECT_VARIANT = "v2a"' "$py" && grep -q "^PPM = 4000.0 " "$py" \
+        || { echo "smoke patch did not apply to k18 (source changed?)"; exit 1; }
+      TAIL=${TAIL:-70} run_kernel k18 "$py" "$D/k18" -v "$D/k07_s0":/kaggle/input/s0:ro -v "$D/k07_s1":/kaggle/input/s1:ro \
+        -v "$D/k07_s2":/kaggle/input/s2:ro -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro ;;
+    k19)
+      # M5 generation probe: offline rdkit from out/smoke/wheels, FPNet from the k15 smoke output (s0 = v2a), wide
+      # search window on the tiny pool (the generation tolerance stays 10 ppm)
+      wheels
+      py=$D/k19.py
+      nb "$ROOT/kaggle/k19_gen_probe/build/casmi26-k19-gen-probe.ipynb" "$py"
+      sed -i 's/^N_BOOT = 2000/N_BOOT = 200/; s/^EXPECT_VARIANT = "v2b"/EXPECT_VARIANT = "v2a"/; s/^SEARCH_CFG = search.SearchCfg() /SEARCH_CFG = search.SearchCfg(ppm_win=4000, ppm_fallback=8000) /' "$py"
+      grep -q '^EXPECT_VARIANT = "v2a"' "$py" && grep -q "^SEARCH_CFG = search.SearchCfg(ppm_win=4000" "$py" \
+        || { echo "smoke patch did not apply to k19 (source changed?)"; exit 1; }
+      TAIL=${TAIL:-60} run_kernel k19 "$py" "$D/k19" "${WHEELS[@]}" -v "$D/data/work":/kaggle/input/k01:ro \
+        -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k15_s0":/kaggle/input/k15:ro ;;
+    k20)
+      # M5 G1: CPU, 2 epochs x 20 steps; wide window as in the k14 smoke (so the fz ranks differ from k15's 10 ppm
+      # ones and the agreement check is off); needs the k14 and k15 (s0 = v2a) smoke outputs
+      py=$D/k20.py
+      nb "$ROOT/kaggle/k20_fwd/build/casmi26-k20-fwd.ipynb" "$py"
+      sed -i 's/^MAX_STEPS = None /MAX_STEPS = 20 /; s/^PPM = 10.0/PPM = 4000.0/; s/^N_BOOT = 2000/N_BOOT = 200/; s/^FPNET_VARIANT = "v2b"/FPNET_VARIANT = "v2a"/; s/^N_VAL = 300 /N_VAL = 20 /; s/^MIN_AGREE = 0.98 /MIN_AGREE = 0.0 /' "$py"
+      grep -q "^MAX_STEPS = 20 " "$py" && grep -q "^MIN_AGREE = 0.0 " "$py" && grep -q '^FPNET_VARIANT = "v2a"' "$py" \
+        || { echo "smoke patch did not apply to k20 (source changed?)"; exit 1; }
+      TAIL=${TAIL:-50} run_kernel k20 "$py" "$D/k20" -v "$D/data/work":/kaggle/input/k01:ro \
+        -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k14":/kaggle/input/k14:ro \
+        -v "$D/k15_s0":/kaggle/input/k15:ro ;;
     *) echo "unknown step $step"; exit 1 ;;
   esac
 done

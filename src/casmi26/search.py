@@ -74,6 +74,7 @@ class Searcher:
         self._pos = np.full(len(self.P), -1, np.int64)
         self._cand = None  # pids whose _pos entry is set (reset after each query; the pool can be large)
         self.rep_pid = self.P.sid2pid[cache.rep_sid]
+        self.last = None  # 直前のクエリの類縁体（apid / asim / ashift、類似度の降順）と FPNet の z（k19 が使う）
 
     # ------------------------------------------------------------------ helpers
     def _window(self, sorted_mass, target, ppm):
@@ -114,6 +115,8 @@ class Searcher:
     def _features(self, specs, hide):
         C, P, cfg, sim = self.C, self.P, self.cfg, self.sim
         t0 = time.time()
+        self.last = dict(apid=np.zeros(0, np.int64), asim=np.zeros(0, np.float32), ashift=np.zeros(0, np.float32),
+                         z=None)
         specs = [s for s in specs if np.isfinite(chem.neutral_mass(s["prec"], s["adduct"]))][:cfg.max_query_spectra]
         target = self.target_mass(specs)
         empty = (np.zeros(0, np.int64), np.zeros((0, len(FEATURES)), np.float32),
@@ -229,12 +232,14 @@ class Searcher:
             X[:, COL["ap_rank"]] = rank_norm(ap4)
             X[:, COL["ap_gap"]] = ap4 - ap4.max()
             top_sim = float(asim[0])
+            self.last.update(apid=apid.astype(np.int64), asim=asim, ashift=ashift)
             X[:, COL["n_analog_hi"]] = float((asim > 0.5).sum())
         X[:, COL["top_sim"]] = top_sim
 
         # ---------------- spectrum -> fingerprint model: f.z of each candidate ----------------
         if self.model is not None:
             z = self.model(specs)
+            self.last["z"] = z
             fz = _unpack(P.fp[cand]) @ z
             X[:, COL["fz"]] = fz / 100.0
             sd = fz.std()
