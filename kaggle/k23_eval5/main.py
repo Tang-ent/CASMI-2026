@@ -22,6 +22,10 @@
 # 照合の厳しさ: 候補の集合は R1 / R2 以外で完全一致、R1 / R2 は 99.9% 以上（fz の切り詰めの境目のわずかな差を許す）。
 # 値は fz 以外の列で 1e-5 以内（外れたら止める）、fz の列は 1e-3 を超えたら警告だけ（CPU の違いで FPNet の出力が
 # わずかに変わりうるため）。列ごとの最大の差は check_k07.csv に書く。
+# v2（2026-10-11、v1 の結果を見た後のユーザーの決定。選び方は変えない）: v1 は類縁体の順番に依る列で止まった。
+#   V / C で数えると、top_tan のずれは 5 / 2000、1 / 1000 クエリだけで、そのクエリでは top_sim が完全に同じ
+#   （類似度が同点の類縁体の並べ方が実行ごとに入れ替わる）。ap4 は 1e-8 以内で一致。そこで類縁体の順番や境目に依る
+#   8 列（TIE_COLS）は、1e-5 を超えてずれたクエリの割合がどのセットでも 1% 以下なら通す（超えたら止める）。
 # 表示だけ: 特徴量の重要度、B_N のライブラリ別、付加の方向だけの G（並べ方には使わない）。
 # 入力: k22-s0〜s3、k07-features2-s0〜s2（v9、照合用）、k05（プール、queries.csv）、k13（M2.2 の順位）。
 
@@ -55,6 +59,8 @@ EXPECT_VARIANT = "v2b"
 REF_K16 = {"A": 0.926, "B_N": 0.518}  # k16 v2 の hybm:0.7:2（v2b の特徴量）
 REF_TOL = 0.005  # 表示の警告だけ（None = 照合しない）
 CHECK_TOL, CHECK_TOL_FZ, CHECK_OVERLAP = 1e-5, 1e-3, 0.999
+TIE_COLS = ["top_tan", "best_tan", "ap1", "tan_self", "ap_rank", "ap_gap", "top_sim", "n_analog_hi"]
+TIE_QUERY_SHARE = 0.01
 REMOVAL = ("de_", "dehydroxy", "H2_remove", "H2_alcohol")
 
 PD = pool.Pool.find_dir()
@@ -92,7 +98,7 @@ X = {s: feats[s][FCOLS["both"]].values for s in SETS}
 # ## 0. 照合: 今の 34 列が k07 v9 と一致するか
 
 # %%
-HARD = [c for c in FL if c not in search.FZ_FEATURES]
+HARD = [c for c in FL if c not in search.FZ_FEATURES and c not in TIE_COLS]
 chk = []
 for s in SETS:
     old = load(f"feats_{s}_L0_s*.parquet", ["qid", "pid"])
@@ -106,16 +112,23 @@ for s in SETS:
     for c in FL:
         d = float(np.nanmax(np.abs(m[c + "_o"].values.astype(np.float64) - m[c + "_n"].values.astype(np.float64)))) \
             if len(m) else 0.0
-        chk.append(dict(set=s, col=c, max_diff=d, overlap=overlap, n=len(m)))
+        dq = m.loc[np.abs(m[c + "_o"].values.astype(np.float64) - m[c + "_n"].values.astype(np.float64)) > CHECK_TOL,
+                   "qid"].nunique() / max(m.qid.nunique(), 1)
+        chk.append(dict(set=s, col=c, max_diff=d, query_share=dq, overlap=overlap, n=len(m)))
 chk = pd.DataFrame(chk)
 chk.to_csv(f"{OUT}/check_k07.csv", index=False)
 bad = chk[chk.col.isin(HARD) & (chk.max_diff > CHECK_TOL)]
 assert bad.empty, f"base features differ from k07 v9:\n{bad}"
-warn = chk[~chk.col.isin(HARD) & (chk.max_diff > CHECK_TOL_FZ)]
+tie = chk[chk.col.isin(TIE_COLS)]
+assert (tie.query_share <= TIE_QUERY_SHARE).all(), f"tie-sensitive analog columns differ too often:\n{tie}"
+print("tie-sensitive analog columns, share of queries that differ:\n",
+      tie[tie.max_diff > CHECK_TOL].round(5).to_string(index=False))
+warn = chk[chk.col.isin(search.FZ_FEATURES) & (chk.max_diff > CHECK_TOL_FZ)]
 if len(warn):
     print("WARNING: fz columns differ from k07 v9 beyond", CHECK_TOL_FZ, "\n", warn.to_string(index=False))
-print(f"k07 v9 check passed: max |diff| non-fz {chk[chk.col.isin(HARD)].max_diff.max():.2e}, "
-      f"fz {chk[~chk.col.isin(HARD)].max_diff.max():.2e}, overlap min {chk.overlap.min():.5f} ({time.time() - T0:.0f}s)")
+print(f"k07 v9 check passed: max |diff| hard columns {chk[chk.col.isin(HARD)].max_diff.max():.2e}, "
+      f"tie columns query share max {tie.query_share.max():.4f}, fz {chk[chk.col.isin(search.FZ_FEATURES)].max_diff.max():.2e}, "
+      f"overlap min {chk.overlap.min():.5f} ({time.time() - T0:.0f}s)")
 
 # %% [markdown]
 # ## 1. プール側のランカー（4 通りの特徴量）と hybm の格子
