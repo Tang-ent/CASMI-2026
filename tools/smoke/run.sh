@@ -8,6 +8,7 @@
 #   (k07 v8 reads the k15 smoke output; k08 / k11 / k13 read older feature names and no longer run on it)
 #   tools/smoke/run.sh k18 k19 k20           # M5 probes (after k14 k15 k07): isomer ceiling, generation, forward model
 #   (k08 / k11 read the pre-v7 feature names feats_<set>_s<i> and no longer run on k07 v7 output)
+#   tools/smoke/run.sh metricid              # metric-identity audit of the real M2.2 / M4 submissions (no kernel)
 # Build the notebooks first (python tools/build_kernel.py k07_features2:3 k08_eval2 k09_submit2 k10_pubchem_probe).
 # Data and outputs go to out/smoke/ (gitignored). Kernel steps run with --network none; setup needs internet (rdkit).
 # k07 runs with a wide mass window (4000 ppm) and a truncation cap of 10 so that ranking and the R truncation are
@@ -261,6 +262,21 @@ for step in $STEPS; do
       TAIL=${TAIL:-40} run_kernel k25 "$py" "$D/k25" -v "$D/data/work":/kaggle/input/k01:ro \
         -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k14":/kaggle/input/k14:ro \
         -v "$D/k15_s0":/kaggle/input/k15:ro -v "$D/k20":/kaggle/input/k20:ro ;;
+    metricid)
+      # keys with the scorer's RDKit 2026.03.3 (out/metric_wheels = metric/rdkit-2026-3-3-wheel) and with our kernels'
+      # 2026.09.1 (out/ds_wheels), then the duplicate / disagreement report
+      O=$D/metricid
+      mkdir -p "$O"
+      SUBS="/data/out/m22_k09/submission.csv /data/out/m4_k17/submission.csv"
+      for w in metric_wheels ds_wheels; do
+        echo "== metricid keys ($w)"
+        docker run --rm --network none -e PIP_NO_INDEX=1 -e PIP_FIND_LINKS=/wheels -v "$ROOT/out/$w":/wheels:ro \
+          -v "$ROOT":/data:ro -v "$O":/o "$IMG" \
+          bash -c "python /data/tools/smoke/metric_identity.py keys /o $SUBS; rc=\$?; chown -R $U /o; exit \$rc"
+      done
+      echo "== metricid report"
+      docker run --rm --network none -v "$ROOT":/data:ro -v "$O":/o "$IMG" \
+        python /data/tools/smoke/metric_identity.py report /o $SUBS | tee "$O/report.txt" ;;
     *) echo "unknown step $step"; exit 1 ;;
   esac
 done
