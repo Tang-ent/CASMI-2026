@@ -13,11 +13,13 @@ parent_ap1 = max_j Tanimoto(parent, analog_j) * sim_j, the same formula for anal
 import numpy as np
 
 from . import chem, derive, frag
-from .search import _zs, rank_norm
+from .search import _zs, _zs_finite, rank_norm
 
 GEN_FEATURES = ["fz", "fz_z", "fz_rank", "ap4", "ap1", "best_tan", "top_tan", "ap_rank", "fwd", "fwd_z",
                 "frag_expl", "frag_top10", "frag_z", "parent_ap1"]
 GCOL = {n: i for i, n in enumerate(GEN_FEATURES)}
+# M6 P1（k30）: fprich の f.z と G2 のコサイン。GEN_FEATURES とは別の列（今の生成のランカーの列は変えない）
+GEN_EXTRA = ["fzr", "fzr_z", "g2", "g2_z"]
 
 
 class GenCfg:
@@ -128,6 +130,25 @@ def features(prods, specs, z, apid, asim, P, fwd=None, sim_power=4.0):
     X[:, GCOL["frag_expl"]] = expl
     X[:, GCOL["frag_top10"]] = top10
     X[:, GCOL["frag_z"]] = _zs(expl)
+    return X
+
+
+def extra_features(prods, specs, z_rich=None, g2=None):
+    """GEN_EXTRA (n, 4) float32 of the products: fprich f.z (z_rich = the query's fprich logits, S.last["z_rich"];
+    the product fingerprint is Morgan r2 + chem.rich_fp_tail of the product SMILES, the pool_fp2 layout) and the G2
+    cosine (g2 = g2.G2Model; NaN without a graph, its z 0). Zeros for a part whose model is not given."""
+    n = len(prods)
+    X = np.zeros((n, len(GEN_EXTRA)), np.float32)
+    if n == 0:
+        return X
+    if z_rich is not None:
+        F = np.stack([np.r_[np.unpackbits(chem.morgan_packed(d["smiles"]))[:chem.FP_BITS],
+                            chem.rich_fp_tail(d["smiles"])] for d in prods]).astype(np.float32)
+        fr = F[:, :len(z_rich)] @ z_rich
+        X[:, 0], X[:, 1] = fr / 100.0, _zs(fr)
+    if g2 is not None:
+        g = g2.score_smiles(specs, [d["smiles"] for d in prods])
+        X[:, 2], X[:, 3] = g, _zs_finite(g)
     return X
 
 

@@ -228,6 +228,58 @@ for step in $STEPS; do
           -v "$D/k15_s0":/kaggle/input/k15:ro \
           -v "$D/k20":/kaggle/input/k20:ro -v "$D/k21":/kaggle/input/k21:ro -v "$D/k25":/kaggle/input/k25:ro
       done ;;
+    k30)
+      # M6 P1 features: k22 + fprich / G2 columns, same smoke patches as k22 (wide window, cut of 10, CPU); the smoke
+      # fprich / G2 models did not pass their gates (REQUIRE_GATES False); needs the k15 (s0), k20, k21, k25, k26, k28 and
+      # k29 smoke outputs. Then the first 41 columns must be byte-identical to the k22 smoke output (same FPNet, CPU)
+      for i in 0 1 2 3; do
+        py=$D/k30_s$i.py
+        nb "$ROOT/kaggle/k30_features4/build_s$i/casmi26-k30-features4-s$i.ipynb" "$py"
+        sed -i 's/^SEARCH_CFG = search.SearchCfg() /SEARCH_CFG = search.SearchCfg(ppm_win=4000, ppm_fallback=8000) /; s/^MAX_CAND_TRAIN = 300/MAX_CAND_TRAIN = 10/; s/^N_TEST = 400 /N_TEST = 20 /; s/^REQUIRE_CUDA = True /REQUIRE_CUDA = False /; s/^REQUIRE_GATES = True /REQUIRE_GATES = False /; s/^GRAPH_WORKERS = 4/GRAPH_WORKERS = 2/' "$py"
+        grep -q "^SEARCH_CFG = search.SearchCfg(ppm_win=4000" "$py" && grep -q "^MAX_CAND_TRAIN = 10" "$py" \
+          && grep -q "^REQUIRE_GATES = False " "$py" || { echo "smoke patch did not apply to k30 (source changed?)"; exit 1; }
+        TAIL=3 run_kernel "k30 shard $i" "$py" "$D/k30_s$i" "${IN_DATA[@]}" -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro \
+          -v "$D/k15_s0":/kaggle/input/k15:ro -v "$D/k20":/kaggle/input/k20:ro -v "$D/k21":/kaggle/input/k21:ro \
+          -v "$D/k25":/kaggle/input/k25:ro -v "$D/k26":/kaggle/input/k26:ro -v "$D/k28":/kaggle/input/k28:ro \
+          -v "$D/k29":/kaggle/input/k29:ro
+      done
+      python3 - "$D" <<'PY'
+import glob, os, sys
+import numpy as np, pandas as pd
+D = sys.argv[1]
+n_files = n_bad = 0
+for f4 in sorted(glob.glob(f"{D}/k30_s*/feats4_*.parquet")):
+    f22 = f4.replace("/k30_s", "/k22_s").replace("feats4_", "feats_")
+    a, b = pd.read_parquet(f4), pd.read_parquet(f22)
+    same = a.shape[0] == b.shape[0] and all(np.array_equal(a[c].values, b[c].values, equal_nan=True) for c in b.columns)
+    n_files += 1
+    n_bad += not same
+    if not same:
+        print("differs:", os.path.basename(f4), [c for c in b.columns if not np.array_equal(a[c].values, b[c].values, equal_nan=True)][:8])
+print(f"k30 vs k22 smoke: {n_files - n_bad}/{n_files} feature files byte-identical in the k22 columns")
+assert n_files and not n_bad
+PY
+      ;;
+    k31)
+      # M6 P1 evaluation on the k30 smoke output (v2a FPNet); the k22 smoke output for the check; CPU
+      nb "$ROOT/kaggle/k31_eval6/build/casmi26-k31-eval6.ipynb" "$D/k31.py"
+      sed -i 's/^N_BOOT = 2000/N_BOOT = 200/; s/^EXPECT_VARIANT = "v2b"/EXPECT_VARIANT = "v2a"/' "$D/k31.py"
+      grep -q '^EXPECT_VARIANT = "v2a"' "$D/k31.py" || { echo "smoke patch did not apply to k31"; exit 1; }
+      M=(); for i in 0 1 2 3; do M+=(-v "$D/k30_s$i":/kaggle/input/k30s$i:ro -v "$D/k22_s$i":/kaggle/input/k22s$i:ro); done
+      TAIL=${TAIL:-25} run_kernel k31 "$D/k31.py" "$D/k31" --memory 6g "${M[@]}" -v "$D/data/pool":/kaggle/input/k05:ro ;;
+    k32)
+      # M6 P1 submission: the k31 smoke keeps k24 v1, so CHOSEN forces fprich + G2 + generation (S3, 0.7, rk) to run
+      # every path (the tiny smoke cache gates most molecules); CPU unless GPU=1; needs the k15 (s0), k20, k21, k25,
+      # k26, k28, k29 and k31 smoke outputs
+      py=$D/k32.py
+      nb "$ROOT/kaggle/k32_submit6/build/casmi26-k32-submit6.ipynb" "$py"
+      sed -i 's/^CHOSEN = None /CHOSEN = dict(kind="pool+gen", keep_k24=False, fcols="both_fprich_g2", variant="hybm:0.7:2", columns=search.FEATURES + frag.FRAG_FEATURES + search.FWD_FEATURES + search.FPRICH_FEATURES + search.G2_FEATURES, slots=list(range(3, 25, 3)), gate=0.7, score="rk", gen_columns=list(gen.GEN_FEATURES)) /; s/^REQUIRE_CUDA = True /REQUIRE_CUDA = False /; s/^GRAPH_WORKERS = 4/GRAPH_WORKERS = 2/' "$py"
+      grep -q '^CHOSEN = dict(kind="pool+gen"' "$py" && grep -q "^REQUIRE_CUDA = False " "$py" || { echo "smoke patch did not apply to k32"; exit 1; }
+      TAIL=${TAIL:-8} run_kernel k32 "$py" "$D/k32" --memory 6g "${IN_DATA[@]}" -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro \
+        -v "$D/k15_s0":/kaggle/input/k15:ro -v "$D/k20":/kaggle/input/k20:ro -v "$D/k21":/kaggle/input/k21:ro \
+        -v "$D/k25":/kaggle/input/k25:ro -v "$D/k26":/kaggle/input/k26:ro -v "$D/k28":/kaggle/input/k28:ro \
+        -v "$D/k29":/kaggle/input/k29:ro -v "$D/k31":/kaggle/input/k31:ro
+      check_sub "$D/k32/submission.csv" ;;
     k23)
       # M5 P1 evaluation on the k22 smoke output (v2a FPNet); k07 smoke output for the check; k13 smoke ranks as M2.2
       nb "$ROOT/kaggle/k23_eval5/build/casmi26-k23-eval5.ipynb" "$D/k23.py"

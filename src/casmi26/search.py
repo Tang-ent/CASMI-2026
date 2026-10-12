@@ -30,6 +30,9 @@ FEATURES = [
 FZ_FEATURES = ["fz", "fz_z", "fz_rank", "fz_gap", "fz_soft", "fz_grp_gap2"]
 PRIOR_FEATURES = ["cand_nspec", "cand_nlib"]
 FWD_FEATURES = ["fwd", "fwd_z", "fwd_rank"]  # 構造→スペクトルの予測器（M5 P1-3。Searcher に fwd を渡したときだけ）
+# M6 P1（k30）: 豊かな指紋の FPNet（fprich、10,407 ビットの f.z）と G2（断片ごとの強度のコサイン）。渡したときだけ
+FPRICH_FEATURES = ["fzr", "fzr_z", "fzr_rank"]
+G2_FEATURES = ["g2", "g2_z", "g2_rank"]  # g2 は構造のグラフが無いと NaN（g2_z は 0、g2_rank は最下位）
 COL = {n: i for i, n in enumerate(FEATURES)}
 
 
@@ -66,19 +69,31 @@ def _zs(x):
     return (x - x.mean()) / sd if sd > 1e-9 else np.zeros_like(x)
 
 
+def _zs_finite(x):
+    """z-score over the finite values (NaN -> 0)."""
+    x = np.asarray(x, np.float64)
+    f = np.isfinite(x)
+    out = np.zeros(len(x), np.float32)
+    if f.sum() > 1 and x[f].std() > 1e-9:
+        out[f] = (x[f] - x[f].mean()) / x[f].std()
+    return out
+
+
 def _unpack(fp_packed):
     return np.unpackbits(fp_packed, axis=1)[:, :chem.FP_BITS].astype(np.float32)
 
 
 class Searcher:
-    def __init__(self, cache, pool=None, cfg=None, sim=SimCfg, model=None, fwd=None, frag=None):
+    def __init__(self, cache, pool=None, cfg=None, sim=SimCfg, model=None, fwd=None, frag=None, fprich=None, g2=None):
         self.C = cache
         self.model = model  # fpnet.FPModel or None
         # M5 P1: fwd = fwd.FwdModel、frag = frag.FragTable。渡したときだけ FEATURES の後ろに列を足す（渡さなければ今までと同じ）
+        # M6 P1: fprich = (fpnet.FPModel of fprich, packed pool_fp2 aligned with the pool), g2 = g2.G2Model（その後ろに足す）
         from .frag import FRAG_FEATURES
-        self.fwd, self.frag = fwd, frag
+        self.fwd, self.frag, self.fprich, self.g2 = fwd, frag, fprich, g2
         self.feature_names = FEATURES + (FRAG_FEATURES if frag is not None else []) + \
-            (FWD_FEATURES if fwd is not None else [])
+            (FWD_FEATURES if fwd is not None else []) + (FPRICH_FEATURES if fprich is not None else []) + \
+            (G2_FEATURES if g2 is not None else [])
         self.P = pool if pool is not None else Pool(cache=cache)
         self.cfg = cfg or SearchCfg()
         self.sim = sim
@@ -127,7 +142,7 @@ class Searcher:
         C, P, cfg, sim = self.C, self.P, self.cfg, self.sim
         t0 = time.time()
         self.last = dict(apid=np.zeros(0, np.int64), asim=np.zeros(0, np.float32), ashift=np.zeros(0, np.float32),
-                         z=None)
+                         z=None, z_rich=None)
         specs = [s for s in specs if np.isfinite(chem.neutral_mass(s["prec"], s["adduct"]))][:cfg.max_query_spectra]
         target = self.target_mass(specs)
         empty = (np.zeros(0, np.int64), np.zeros((0, len(self.feature_names)), np.float32),
@@ -276,6 +291,15 @@ class Searcher:
         if self.fwd is not None:
             fw = self.fwd.score(specs, P.fp[cand])
             extra.append(np.c_[fw, _zs(fw), rank_norm(fw)])
+        if self.fprich is not None:
+            mr, fp2 = self.fprich
+            zr = mr(specs)
+            self.last["z_rich"] = zr
+            fr = np.unpackbits(fp2[cand], axis=1)[:, :len(zr)].astype(np.float32) @ zr
+            extra.append(np.c_[fr / 100.0, _zs(fr), rank_norm(fr)])
+        if self.g2 is not None:
+            g = self.g2.score(specs, cand)
+            extra.append(np.c_[g, _zs_finite(g), rank_norm(np.nan_to_num(g, nan=-1.0))])
         if extra:
             X = np.hstack([X] + extra).astype(np.float32)
         info = dict(target=target, n_cand=nc, ppm=ppm, lib_max=gmax, top_sim=top_sim, secs=time.time() - t0)

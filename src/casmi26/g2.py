@@ -446,11 +446,14 @@ def to_torch(b, dev):
 
 # ---------------------------------------------------------------------------------------------- inference
 class G2Model:
-    """score(specs, pids) -> (n,) mean cosine over the usable query spectra (NaN for structures without a graph)."""
+    """score(specs, pids) -> (n,) mean cosine over the usable query spectra (NaN for structures without a graph).
+    Inference is fp32 unless amp=True, so that GPU and CPU give the same features (as fwd; the k29 gate was scored
+    with amp). score_smiles scores structures given as SMILES (generated products)."""
 
-    def __init__(self, path=None, G=None, net=None, cfg=None, device=None):
+    def __init__(self, path=None, G=None, net=None, cfg=None, device=None, amp=False):
         import torch
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.amp = bool(amp)
         self.G = G
         if net is None:
             ck = torch.load(path, map_location="cpu", weights_only=False)
@@ -478,18 +481,19 @@ class G2Model:
         if not qs:
             return out
         dev = self.device
+        amp = self.amp and dev == "cuda"
         with torch.no_grad():
             for a in range(0, n, chunk):
                 ps = [piece(self.G, p) for p in pids[a:a + chunk]]
                 b = collate(ps)
                 bt = to_torch(b, dev)
-                with torch.autocast("cuda", dtype=torch.float16, enabled=dev == "cuda"):
+                with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
                     pre = self.net.encode(bt)
                 acc = np.zeros(len(ps))
                 for om, ow, ion, cond in qs:
                     jou = jou_array([match(p["umz"], ion, om) if p else None for p in ps])
                     c = torch.as_tensor(cond, device=dev).expand(len(ps), -1)
-                    with torch.autocast("cuda", dtype=torch.float16, enabled=dev == "cuda"):
+                    with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
                         lg = self.net.head(pre, c)
                     obs = torch.as_tensor(np.pad(ow, (0, TOP_PEAKS - len(ow)))[None], device=dev)
                     cos = cosine(lg, bt["valid"], bt["u"], torch.as_tensor(jou, device=dev), obs,
@@ -498,6 +502,15 @@ class G2Model:
                 sl = out[a:a + chunk]
                 sl[has[a:a + chunk]] = (acc / len(qs))[has[a:a + chunk]]
         return out
+
+    def score_smiles(self, specs, smiles, chunk=256):
+        """score() for structures given as SMILES (their graphs are built here, in this process)."""
+        G0 = self.G
+        try:
+            self.G = Graphs.build(list(smiles))
+            return self.score(specs, np.arange(len(smiles)), chunk)
+        finally:
+            self.G = G0
 
 
 # ---------------------------------------------------------------------------------------------- training

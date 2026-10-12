@@ -28,16 +28,19 @@ def predict(models, X):
     return np.mean([m.predict(X, num_threads=4) for m in models], axis=0)
 
 
-def cv_oof(df, features, n_folds=5, seed=0, groups=None, **kw):
+def cv_oof(df, features, n_folds=5, seed=0, groups=None, model_seeds=None, **kw):
     """Out-of-fold scores -> np.ndarray aligned with df rows. Folds are over qid, or over groups[qid] when a
-    qid -> group mapping is given (e.g. the truth structure, so R1/R2 queries of one structure share a fold)."""
+    qid -> group mapping is given (e.g. the truth structure, so R1/R2 queries of one structure share a fold).
+    The folds come from `seed`; each fold's score is the mean over LightGBM models with model_seeds (default: [seed],
+    the M5 behaviour)."""
     g = df["qid"].map(groups).values if groups is not None else df["qid"].values
     q = np.unique(g)
     rng = np.random.default_rng(seed)
     fold_of = dict(zip(q, rng.permutation(len(q)) % n_folds))
     f = pd.Series(g).map(fold_of).values
+    seeds = [seed] if model_seeds is None else list(model_seeds)
     oof = np.zeros(len(df))
     for k in range(n_folds):
-        m = fit(df[f != k], features, seed=seed, **kw)
-        oof[f == k] = m.predict(df.loc[f == k, features].values.astype(np.float32))
+        Xk = df.loc[f == k, features].values.astype(np.float32)
+        oof[f == k] = np.mean([fit(df[f != k], features, seed=s, **kw).predict(Xk) for s in seeds], axis=0)
     return oof
