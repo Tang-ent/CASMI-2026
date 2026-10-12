@@ -27,10 +27,11 @@ def list_output(kernel):
 def download(f, path):
     out = os.path.join(path, f.file_name)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-    r = requests.get(f.url)
-    r.raise_for_status()
-    with open(out, "wb") as fh:
-        fh.write(r.content)
+    with requests.get(f.url, stream=True) as r:  # streamed: the cache files are several GB
+        r.raise_for_status()
+        with open(out, "wb") as fh:
+            for chunk in r.iter_content(1 << 23):
+                fh.write(chunk)
     print("downloaded", out)
     return out
 

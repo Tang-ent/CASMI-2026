@@ -12,7 +12,7 @@ import time
 
 import numpy as np
 
-from . import chem
+from . import chem, ckpt
 from .harness import TIMS_LIBS
 
 ADDUCT_LIST = ["[M+H]+", "[M+NH4]+", "[M+Na]+", "[M+K]+", "[M-H2O+H]+", "[M-2H2O+H]+", "[M]+", "[M+2H]2+",
@@ -232,16 +232,17 @@ def _batches(o, batch):
 
 
 # ---------------------------------------------------------------------------------------------- evaluation
-def window_mrr(model_fn, C, P, queries, ppm=10.0, k=25):
+def window_mrr(model_fn, C, P, queries, ppm=10.0, k=25, fp=None):
     """MRR@k of the truth among pool candidates within +-ppm of the truth's mass, scored by f.z
     (molecule logits = mean of per-spectrum logits). queries: DataFrame with pid, rows.
     Ties count in the truth's favour (rank = 1 + number of strictly better candidates)."""
     from .harness import query_specs
+    fp = P.fp if fp is None else fp
     rr = []
     for q in queries.itertuples():
         z = model_fn(query_specs(C, q.rows))
         cand = P.window(P.mass[q.pid], ppm)
-        f = np.unpackbits(P.fp[cand], axis=1)[:, :len(z)].astype(np.float32)
+        f = np.unpackbits(fp[cand], axis=1)[:, :len(z)].astype(np.float32)
         s = f @ z
         rank = 1 + int((s > s[np.flatnonzero(cand == q.pid)[0]]).sum())
         rr.append(1.0 / rank if rank <= k else 0.0)
@@ -256,14 +257,18 @@ def truth_ranks(s, cand, pid):
     return 1 + better, 1 + better + int((tie & (cand < pid)).sum()), 1 + better + int(tie.sum())
 
 
-def window_ranks(Z, P, pids, ppm=10.0):
+def window_ranks(Z, P, pids, ppm=10.0, fp=None, keep=None):
     """Ranks of each truth pid among the pool candidates within +-ppm of its mass, scored by f.Z[i].
-    -> DataFrame(n_cand, r_opt, r_pid, r_pess), one row per query (same order as pids)."""
+    fp: packed fingerprints per pid (default P.fp). keep(cand, pid) -> bool mask: optional candidate filter (M6: the
+    same-formula candidates); the truth must pass it. -> DataFrame(n_cand, r_opt, r_pid, r_pess), one row per query."""
     import pandas as pd
+    fp = P.fp if fp is None else fp
     out = []
     for z, p in zip(Z, pids):
         cand = P.window(P.mass[p], ppm)
-        s = np.unpackbits(P.fp[cand], axis=1)[:, :len(z)].astype(np.float32) @ z
+        if keep is not None:
+            cand = cand[keep(cand, p)]
+        s = np.unpackbits(fp[cand], axis=1)[:, :len(z)].astype(np.float32) @ z
         out.append((len(cand), *truth_ranks(s, cand, p)))
     return pd.DataFrame(out, columns=["n_cand", "r_opt", "r_pid", "r_pess"])
 
@@ -306,6 +311,17 @@ def provenance_coef(Z, P, pids, holdout, ppm=10.0, n_boot=2000, seed=2):
     return dict(out, n_co=int(N[:, 0].sum()), n_ho=int(N[:, 1].sum()))
 
 
+def cfg_of(d):
+    """An instance copy of Cfg with the checkpoint's values (does not touch the module-level Cfg)."""
+    c = type("CfgView", (), {})()
+    for k in dir(Cfg):
+        if not k.startswith("_"):
+            setattr(c, k, getattr(Cfg, k))
+    for k, v in d.items():
+        setattr(c, k, v)
+    return c
+
+
 class FPModel:
     """Inference wrapper: molecule logits z (nbits,) from a list of spectra dicts. The preprocessing and the
     timsTOF setting come from the checkpoint's cfg (defaults = k06), stored per instance in `prep`."""
@@ -313,14 +329,15 @@ class FPModel:
     def __init__(self, path, device=None):
         import torch
         ck = torch.load(path, map_location="cpu", weights_only=False)
-        for k, v in ck["cfg"].items():
-            setattr(Cfg, k, v)
+        # M6: the checkpoint's cfg lives on the instance (several models in one process, e.g. v2b and fprich);
+        # the module-level Cfg is left alone
+        self.cfg = cfg_of(ck["cfg"])
         self.nbits, self.epoch = ck["nbits"], ck.get("epoch", -1)
         cfg = ck["cfg"]
         self.prep = dict(floor=cfg.get("peak_floor", 0.0), max_peaks=cfg.get("max_peaks", MAX_PEAKS),
                          tims_fixed=cfg.get("tims_fixed"))
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.net = build_model(self.nbits).to(self.device).eval()
+        self.net = build_model(self.nbits, self.cfg).to(self.device).eval()
         self.net.load_state_dict(ck["model"])
 
     def _items(self, specs):
@@ -372,7 +389,7 @@ def load_checked(name="fpnet.pt", min_epoch=10, threads=2):
     torch.set_num_threads(threads)
     path = paths.find(name)
     m = FPModel(path, device="cpu")
-    print(f"[fpnet] {path}: epoch {m.epoch}, d {Cfg.d}, layers {Cfg.layers}, {m.nbits} bits")
+    print(f"[fpnet] {path}: epoch {m.epoch}, d {m.cfg.d}, layers {m.cfg.layers}, {m.nbits} bits")
     if m.epoch < min_epoch:
         raise RuntimeError(f"checkpoint epoch {m.epoch} < {min_epoch}: not the full k06 run")
     return m
@@ -380,13 +397,17 @@ def load_checked(name="fpnet.pt", min_epoch=10, threads=2):
 
 # ---------------------------------------------------------------------------------------------- training loop
 def train(C, P, holdout_pids, val_queries, out_path, frac=1.0, epochs=None, budget_secs=10.5 * 3600,
-          extra_val=None, log=print, seed=0, track=None, select="best", eval_every=1):
+          extra_val=None, log=print, seed=0, track=None, select="best", eval_every=1, fp=None, nbits=None,
+          resume=None):
     """Train on the non-holdout spectra (all of them, or the v2 per-epoch draw); validate (window MRR on
     val_queries and extra_val) every `eval_every` epochs and on the last one. Returns the history list.
     select="best": out_path = the best checkpoint by val MRR (k06); select="last": out_path = the last epoch (v2,
     so that no evaluation set picks the epoch). The latest epoch is always also written to <out>_last.pt.
     Epochs: Cfg.total_steps > 0 sets them from the epoch size, else `epochs` or Cfg.epochs.
-    track: optional casmi26.track.Run; losses every 500 steps and the epoch records are logged to it."""
+    track: optional casmi26.track.Run; losses every 500 steps and the epoch records are logged to it.
+    fp / nbits (M6 k28): packed target fingerprints per pid and their bit count (default P.fp, chem.FP_BITS).
+    Every epoch also writes the full training state to <out>_state.pt (ckpt); resume=<that path> continues after its
+    epoch with the same cfg (the time budget counts from the resumed start)."""
     import threading
     import queue
 
@@ -398,7 +419,8 @@ def train(C, P, holdout_pids, val_queries, out_path, frac=1.0, epochs=None, budg
     rng = np.random.default_rng(seed)
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     D = TrainData(C, P, holdout_pids, frac=frac, seed=seed)
-    nbits = chem.FP_BITS
+    nbits = nbits or chem.FP_BITS
+    fp = P.fp if fp is None else fp
     net = build_model(nbits).to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=Cfg.lr, weight_decay=Cfg.wd)
     probe = D.epoch_index(np.random.default_rng(seed + 12345))  # epoch size (the draw sizes are fixed)
@@ -413,7 +435,7 @@ def train(C, P, holdout_pids, val_queries, out_path, frac=1.0, epochs=None, budg
     sched = torch.optim.lr_scheduler.LambdaLR(
         opt, lambda s: min(1.0, (s + 1) / Cfg.warmup) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / total))))
     scaler = torch.amp.GradScaler("cuda", enabled=dev == "cuda")
-    fp_gpu = torch.as_tensor(P.fp, device=dev)
+    fp_gpu = torch.as_tensor(fp, device=dev)
     log(f"[fpnet] {len(D):,} training spectra, {steps_per_epoch:,} steps/epoch, {epochs} epochs, device {dev}, "
         f"params {sum(p.numel() for p in net.parameters()) / 1e6:.1f}M")
 
@@ -425,9 +447,13 @@ def train(C, P, holdout_pids, val_queries, out_path, frac=1.0, epochs=None, budg
             qout.put((collate(D.items(idx)), pids, neg))
         qout.put(None)
 
-    hist, best, gstep = [], -1.0, 0  # gstep: 全エポック通しのステップ数（wandb の step）
+    hist, best, gstep, ep0 = [], -1.0, 0, 0  # gstep: 全エポック通しのステップ数（wandb の step）
     cfg_dump = {k: getattr(Cfg, k) for k in dir(Cfg) if not k.startswith("_")}
-    for ep in range(epochs):
+    if resume:
+        x = ckpt.load_state(resume, net, opt, sched, scaler, rng, cfg=dict(cfg_dump, nbits=nbits))
+        hist, best, gstep, ep0 = x["hist"], x["best"], x["gstep"], x["epoch"] + 1
+        log(f"[fpnet] resumed from {resume}: epoch {x['epoch']} done, step {gstep:,}")
+    for ep in range(ep0, epochs):
         net.train()
         batches = _batches(D.epoch_index(rng), Cfg.batch)
         qb = queue.Queue(maxsize=8)
@@ -488,14 +514,16 @@ def train(C, P, holdout_pids, val_queries, out_path, frac=1.0, epochs=None, budg
                    epoch_secs=time.time() - te)
         if (ep + 1) % eval_every == 0 or ep == epochs - 1 or out_of_time:
             wrap = _Wrap(net, dev, nbits)
-            rec["val_mrr"] = v = window_mrr(wrap, C, P, val_queries)
+            rec["val_mrr"] = v = window_mrr(wrap, C, P, val_queries, fp=fp)
             if extra_val is not None:
                 for name, qx in extra_val.items():
-                    rec[f"{name}_mrr"] = window_mrr(wrap, C, P, qx)
+                    rec[f"{name}_mrr"] = window_mrr(wrap, C, P, qx, fp=fp)
             if select == "best" and v > best:
                 best = v
                 torch.save(ck, out_path)
         hist.append(rec)
+        ckpt.save_state(ckpt.state_path(out_path), net, opt, sched, scaler, rng, cfg=dict(cfg_dump, nbits=nbits),
+                        epoch=ep, gstep=gstep, hist=hist, best=best)
         if track is not None:
             track.log({f"epoch/{k}": x for k, x in rec.items()}, step=gstep)
             ev = [r for r in hist if "val_mrr" in r]

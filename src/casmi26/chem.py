@@ -160,3 +160,29 @@ def alt_fps(smiles):
     multi = np.concatenate([r["gen"].GetFingerprintAsNumPy(m).astype(np.uint8), mac,
                             r["ap"].GetFingerprintAsNumPy(m).astype(np.uint8)])
     return np.packbits(r["g3"].GetFingerprintAsNumPy(m).astype(np.uint8)), np.packbits(multi)
+
+
+# M6 P0-2 (k26_fp2 / k28_fprich): multi-block fingerprint targets. Block 0 is the pool's Morgan r=2 2048 (P.fp), so the
+# first 2048 bits of P.fp2 equal P.fp; the other blocks come from the pool's canonical SMILES.
+RICH_FP_BLOCKS = [("morgan2", 2048), ("fcfp4", 2048), ("atompair", 2048), ("torsion", 2048), ("rdkit5", 2048),
+                  ("maccs", 167)]
+RICH_FP_BITS = sum(n for _, n in RICH_FP_BLOCKS)
+
+
+def rich_fp_tail(smiles):
+    """Unpacked bits (uint8) of RICH_FP_BLOCKS[1:] for one SMILES; zeros when RDKit cannot parse."""
+    r = _rdkit()
+    if "rich" not in r:
+        from rdkit import DataStructs
+        from rdkit.Chem import MACCSkeys, rdFingerprintGenerator as G
+        r["rich"] = [G.GetMorganGenerator(radius=2, fpSize=2048, atomInvariantsGenerator=G.GetMorganFeatureAtomInvGen()),
+                     G.GetAtomPairGenerator(fpSize=2048), G.GetTopologicalTorsionGenerator(fpSize=2048),
+                     G.GetRDKitFPGenerator(maxPath=5, fpSize=2048)]
+        r["maccs"], r["ds"] = MACCSkeys.GenMACCSKeys, DataStructs
+    n_tail = RICH_FP_BITS - RICH_FP_BLOCKS[0][1]
+    m = r["Chem"].MolFromSmiles(smiles) if isinstance(smiles, str) else None
+    if m is None:
+        return np.zeros(n_tail, np.uint8)
+    mac = np.zeros(167, np.uint8)
+    r["ds"].ConvertToNumpyArray(r["maccs"](m), mac)
+    return np.concatenate([g.GetFingerprintAsNumPy(m).astype(np.uint8) for g in r["rich"]] + [mac])

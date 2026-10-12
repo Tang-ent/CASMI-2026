@@ -22,13 +22,16 @@ COMP=$ROOT/enveda-CASMI26-molecule-id-mass-spectra
 STEPS=${*:-setup model k07 k08 k09}
 mkdir -p "$D"
 
+# GPU=1: give the containers the local GPU (exercises the CUDA paths: autocast, GradScaler, fp16 attention bias)
+GPU_ARGS=()
+[ "${GPU:-0}" = 1 ] && GPU_ARGS=(--gpus all)
 # run_kernel <label> <script> <outdir> <docker args...>: run a converted notebook, keep its log in <outdir>/run.log
 run_kernel() {
   local label=$1 script=$2 out=$3
   shift 3
   mkdir -p "$out"
   echo "== $label"
-  docker run --rm --network none -e KAGGLE_KERNEL_RUN_TYPE=Batch "$@" -v "$script":/run.py:ro \
+  docker run --rm --network none -e KAGGLE_KERNEL_RUN_TYPE=Batch "${GPU_ARGS[@]}" "$@" -v "$script":/run.py:ro \
     -v "$out":/kaggle/working "$IMG" \
     bash -c "cd /kaggle/working && python /run.py > run.log 2>&1; rc=\$?; chown -R $U /kaggle/working; exit \$rc" \
     || { tail -30 "$out/run.log"; exit 1; }
@@ -261,6 +264,66 @@ for step in $STEPS; do
       TAIL=${TAIL:-40} run_kernel k25 "$py" "$D/k25" -v "$D/data/work":/kaggle/input/k01:ro \
         -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k14":/kaggle/input/k14:ro \
         -v "$D/k15_s0":/kaggle/input/k15:ro -v "$D/k20":/kaggle/input/k20:ro ;;
+    subform)
+      # M6: numba subformula annotation == the naive enumeration on 300 smoke spectra
+      docker run --rm --network none -v "$ROOT/src":/src:ro -v "$D/data":/d:ro -v "$ROOT/tools/smoke/check_subform.py":/c.py:ro \
+        -e NUMBA_CACHE_DIR=/tmp/numba "$IMG" bash -c "python /c.py 2>&1 | grep -v -i warn | tail -5" ;;
+    resume)
+      # training state / resume (ckpt): fpnet and enc3 resumed after epoch 0 == straight, decoder keeps its schedule;
+      # CPU, needs the k26 smoke output; rdkit (decoder SMILES) from out/ds_wheels
+      mkdir -p "$D/resume"
+      docker run --rm --network none --memory 6g -v "$ROOT/src":/src:ro -v "$D/data":/d:ro -v "$D/k26":/k26:ro \
+        -v "$D/resume":/w -v "$ROOT/tools/smoke/check_resume.py":/c.py:ro -v "$ROOT/out/ds_wheels":/wheels:ro \
+        -e NUMBA_CACHE_DIR=/tmp/numba "$IMG" bash -c "pip install -q --no-index --find-links /wheels rdkit > /dev/null 2>&1; \
+        python /c.py > /w/run.log 2>&1; rc=\$?; chown -R $U /w; exit \$rc" || { tail -30 "$D/resume/run.log"; exit 1; }
+      grep -v -i warn "$D/resume/run.log" | tail -8 ;;
+    k26)
+      # M6 pool formulas + rich fingerprints of the smoke pool (rdkit from out/ds_wheels as the casmi26-wheels dataset)
+      nb "$ROOT/kaggle/k26_fp2/build/casmi26-k26-fp2.ipynb" "$D/k26.py"
+      TAIL=${TAIL:-25} run_kernel k26 "$D/k26.py" "$D/k26" -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro \
+        -v "$D/data/work":/kaggle/input/k01:ro -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro ;;
+    k27)
+      # M6 P0-1 enc3: CPU, 2 epochs x 20 steps of 32 spectra; wide window (so the v2b agreement check is off); needs the
+      # k14, k15 (s1 = v2b) and k26 smoke outputs
+      py=$D/k27.py
+      nb "$ROOT/kaggle/k27_enc3/build/casmi26-k27-enc3.ipynb" "$py"
+      sed -i 's/^TOTAL_STEPS = None /TOTAL_STEPS = 1600 /; s/^BATCH = None /BATCH = 32 /; s/^MAX_STEPS_PER_EPOCH = None /MAX_STEPS_PER_EPOCH = 20 /; s/^FIT = None /FIT = (5, 10) /; s/^PPM = 10.0/PPM = 4000.0/; s/^N_BOOT = 2000/N_BOOT = 200/; s/^N_VAL = 300 /N_VAL = 20 /; s/^MIN_AGREE = 0.98 /MIN_AGREE = 0.0 /' "$py"
+      grep -q "^MAX_STEPS_PER_EPOCH = 20 " "$py" && grep -q "^MIN_AGREE = 0.0 " "$py" && grep -q "^PPM = 4000.0" "$py" \
+        || { echo "smoke patch did not apply to k27 (source changed?)"; exit 1; }
+      TAIL=${TAIL:-40} run_kernel k27 "$py" "$D/k27" -v "$D/data/work":/kaggle/input/k01:ro \
+        -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k14":/kaggle/input/k14:ro \
+        -v "$D/k15_s1":/kaggle/input/k15:ro -v "$D/k26":/kaggle/input/k26:ro ;;
+    k28)
+      # M6 P0-2 fprich: CPU, batch 32 (memory), one epoch (40 steps -> ceil to whole epochs); wide window (agreement off); needs the k14,
+      # k15 (s1 = v2b) and k26 smoke outputs
+      py=$D/k28.py
+      nb "$ROOT/kaggle/k28_fprich/build/casmi26-k28-fprich.ipynb" "$py"
+      sed -i 's/^TOTAL_STEPS = None /TOTAL_STEPS = 40 /; s/^PPM = 10.0/PPM = 4000.0/; s/^N_BOOT = 2000/N_BOOT = 200/; s/^MIN_AGREE = 0.98 /MIN_AGREE = 0.0 /; s/^BATCH = None /BATCH = 32 /' "$py"
+      grep -q "^TOTAL_STEPS = 40 " "$py" && grep -q "^MIN_AGREE = 0.0 " "$py" && grep -q "^BATCH = 32 " "$py" || { echo "smoke patch did not apply to k28"; exit 1; }
+      TAIL=${TAIL:-30} run_kernel k28 "$py" "$D/k28" --memory 6g -e PYTHONUNBUFFERED=1 -v "$D/data/work":/kaggle/input/k01:ro \
+        -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k14":/kaggle/input/k14:ro \
+        -v "$D/k15_s1":/kaggle/input/k15:ro -v "$D/k26":/kaggle/input/k26:ro ;;
+    k33)
+      # M6 P0-4 decoder training: CPU, 30 steps of 16; a few report queries; needs the k15 (s1 = v2b) and k26 smoke
+      # outputs; rdkit from out/ds_wheels
+      py=$D/k33.py
+      nb "$ROOT/kaggle/k33_decoder/build/casmi26-k33-decoder.ipynb" "$py"
+      sed -i 's/^TOTAL_STEPS = None /TOTAL_STEPS = 30 /; s/^FIT = None /FIT = (5, 10) /; s/^BATCH = None/BATCH = 16/; s/^N_VAL = 2000/N_VAL = 20/; s/^N_REPORT, N_REPORT_SAMPLES = 300, 128/N_REPORT, N_REPORT_SAMPLES = 4, 8/' "$py"
+      grep -q "^TOTAL_STEPS = 30 " "$py" && grep -q "^N_REPORT, N_REPORT_SAMPLES = 4, 8" "$py" || { echo "smoke patch did not apply to k33"; exit 1; }
+      TAIL=${TAIL:-25} run_kernel k33 "$py" "$D/k33" -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro \
+        -v "$D/data/work":/kaggle/input/k01:ro -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro \
+        -v "$D/k15_s1":/kaggle/input/k15:ro -v "$D/k26":/kaggle/input/k26:ro ;;
+    k34)
+      # M6 P0-4 gate D on 4 queries per group, 64 samples, wide search window, the truth injected into the raw decoder
+      # output (exercises the product path; the smoke decoder is untrained); needs the k15 (s1), k26 and k33 smoke outputs
+      py=$D/k34.py
+      nb "$ROOT/kaggle/k34_dec_eval/build/casmi26-k34-dec-eval.ipynb" "$py"
+      sed -i 's/^N_BOOT = 2000/N_BOOT = 200/; s/^N_SAMPLES, MAX_FORMULAS, MIN_PER = 512, 8, 32/N_SAMPLES, MAX_FORMULAS, MIN_PER = 64, 8, 8/; s/^MAX_QUERIES = None /MAX_QUERIES = 4 /; s/^INJECT_TRUTH = False /INJECT_TRUTH = True /; s/^SEARCH_CFG = search.SearchCfg() /SEARCH_CFG = search.SearchCfg(ppm_win=4000, ppm_fallback=8000) /' "$py"
+      grep -q "^MAX_QUERIES = 4 " "$py" && grep -q "^INJECT_TRUTH = True " "$py" && grep -q "^SEARCH_CFG = search.SearchCfg(ppm_win=4000" "$py" \
+        || { echo "smoke patch did not apply to k34"; exit 1; }
+      TAIL=${TAIL:-25} run_kernel k34 "$py" "$D/k34" -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro \
+        -v "$D/data/work":/kaggle/input/k01:ro -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro \
+        -v "$D/k15_s1":/kaggle/input/k15:ro -v "$D/k26":/kaggle/input/k26:ro -v "$D/k33":/kaggle/input/k33:ro ;;
     *) echo "unknown step $step"; exit 1 ;;
   esac
 done
