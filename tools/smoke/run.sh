@@ -277,6 +277,26 @@ for step in $STEPS; do
         -e NUMBA_CACHE_DIR=/tmp/numba "$IMG" bash -c "pip install -q --no-index --find-links /wheels rdkit > /dev/null 2>&1; \
         python /c.py > /w/run.log 2>&1; rc=\$?; chown -R $U /w; exit \$rc" || { tail -30 "$D/resume/run.log"; exit 1; }
       grep -v -i warn "$D/resume/run.log" | tail -8 ;;
+    g2)
+      # M6 P0-3 G2: fragment masses == frag.py, cosine unit checks, one batch, resume == straight (CPU, needs k26)
+      mkdir -p "$D/g2"
+      docker run --rm --network none --memory 6g -v "$ROOT/src":/src:ro -v "$D/data":/d:ro -v "$D/k26":/k26:ro \
+        -v "$D/g2":/w -v "$ROOT/tools/smoke/check_g2.py":/c.py:ro -v "$ROOT/out/ds_wheels":/wheels:ro \
+        -e NUMBA_CACHE_DIR=/tmp/numba "$IMG" bash -c "pip install -q --no-index --find-links /wheels rdkit > /dev/null 2>&1; \
+        python /c.py > /w/run.log 2>&1; rc=\$?; chown -R $U /w; exit \$rc" || { tail -30 "$D/g2/run.log"; exit 1; }
+      grep -v -i warn "$D/g2/run.log" | tail -12 ;;
+    k29)
+      # M6 P0-3 G2 kernel: 30 steps of 4 spectra x (1 + 4), wide window, 40 queries (agreement off); needs the k14,
+      # k15 (s1 = v2b), k20 and k26 smoke outputs; rdkit from out/ds_wheels
+      py=$D/k29.py
+      nb "$ROOT/kaggle/k29_g2/build/casmi26-k29-g2.ipynb" "$py"
+      sed -i 's/^TOTAL_STEPS = None /TOTAL_STEPS = 30 /; s/^BATCH, K_NEG, WORKERS = None, None, None /BATCH, K_NEG, WORKERS = 4, 4, 2 /; s/^FIT = None /FIT = (5, 10) /; s/^PPM = 10.0/PPM = 4000.0/; s/^N_BOOT = 2000/N_BOOT = 200/; s/^MIN_AGREE = 0.98 /MIN_AGREE = 0.0 /; s/^MAX_QUERIES = None /MAX_QUERIES = 40 /; s/^EVAL_PROBE = 30 /EVAL_PROBE = 3 /; s/^GRAPH_WORKERS = 4/GRAPH_WORKERS = 2/' "$py"
+      grep -q "^TOTAL_STEPS = 30 " "$py" && grep -q "^MIN_AGREE = 0.0 " "$py" && grep -q "^MAX_QUERIES = 40 " "$py" \
+        && grep -q "^BATCH, K_NEG, WORKERS = 4, 4, 2 " "$py" || { echo "smoke patch did not apply to k29"; exit 1; }
+      TAIL=${TAIL:-30} run_kernel k29 "$py" "$D/k29" --memory 6g -e PYTHONUNBUFFERED=1 \
+        -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro -v "$D/data/work":/kaggle/input/k01:ro \
+        -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k14":/kaggle/input/k14:ro \
+        -v "$D/k15_s1":/kaggle/input/k15:ro -v "$D/k20":/kaggle/input/k20:ro -v "$D/k26":/kaggle/input/k26:ro ;;
     k26)
       # M6 pool formulas + rich fingerprints of the smoke pool (rdkit from out/ds_wheels as the casmi26-wheels dataset)
       nb "$ROOT/kaggle/k26_fp2/build/casmi26-k26-fp2.ipynb" "$D/k26.py"
