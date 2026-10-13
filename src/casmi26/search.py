@@ -448,3 +448,87 @@ def route_score(X, rk, p, w, mode, t=0.5, qid=None):
     if mode == "soft":
         return p * zscore_by(la, qid) + (1 - p) * zscore_by(c2, qid) + tie
     raise ValueError(mode)
+
+
+# ---------------------------------------------------------------- M7: pool-side scoring variants by name
+SLOT_SETS = {"S5": [5, 10, 15, 20, 25], "S3": list(range(3, 25, 3)), "S2": list(range(2, 25, 2)), "S10": [10, 20]}
+
+
+def parse_variant(name):
+    """'<cols>|<score>+gen:<slots>:<gate>:<gen score>' or '<cols>|<score>+nogen' (k31 / k35 model names) ->
+    dict(cols, score=(kind, params), gen=None or dict(slots_name, slots, gate, score)).
+    Scores: hybm:tau:w (blend_score), hybb:tau_lo:tau_hi:w_lo:w_hi (blend_score with w_hi for molecules whose
+    lib_grp_max is in [tau_lo, tau_hi), w_lo below, the rule from tau_hi up), hybi:tau_lo:tau_hi:w (rule order and
+    ranker order interleaved in [tau_lo, tau_hi), see variant_order)."""
+    cols, _, rest = name.partition("|")
+    assert cols and rest, name
+    score, _, g = rest.partition("+")
+    kind, *a = score.split(":")
+    n_par = {"hybm": 2, "hybb": 4, "hybi": 3}
+    assert kind in n_par and len(a) == n_par[kind], f"unknown score variant {score!r}"
+    a = tuple(float(x) for x in a)
+    if kind != "hybm":
+        assert a[0] < a[1], f"{score}: tau_lo must be below tau_hi"
+    if g in ("", "nogen"):
+        gen = None
+    else:
+        tag, slots_name, gate, gscore = g.split(":")
+        assert tag == "gen" and slots_name in SLOT_SETS and gscore in ("rk", "rkx"), f"unknown generation {g!r}"
+        gen = dict(slots_name=slots_name, slots=list(SLOT_SETS[slots_name]), gate=float(gate), score=gscore)
+    return dict(cols=cols, score=(kind, a), gen=gen)
+
+
+def _interleave(a, b):
+    """a[0], b[0], a[1], b[1], ... without repeats (a and b are permutations of the same rows)."""
+    out, seen = [], set()
+    for x, y in zip(a, b):
+        for v in (x, y):
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+    return np.asarray(out, np.int64)
+
+
+def variant_order(X, rk, score):
+    """Row order (best first) of ONE molecule's candidates under a parsed score variant (parse_variant()['score']).
+    rk: the ranker's raw score per row. hybm == argsort of blend_score (stable), so it reproduces k31 / k32."""
+    kind, a = score
+    st = lambda s: np.argsort(-s, kind="mergesort")
+    if kind == "hybm":
+        return st(blend_score(X, a[0], rk, a[1]))
+    gmax = float(X[0, COL["lib_grp_max"]]) if len(X) else 0.0
+    if kind == "hybb":
+        t_lo, t_hi, w_lo, w_hi = a
+        return st(blend_score(X, t_hi, rk, w_hi if gmax >= t_lo else w_lo))
+    t_lo, t_hi, w = a  # hybi
+    if gmax >= t_hi or gmax < t_lo:
+        return st(blend_score(X, t_hi, rk, w))
+    return _interleave(st(rule_score(X, "lib_analog")), st(blend_score(X, t_hi, rk, w)))
+
+
+# ---------------------------------------------------------------- M7: same-formula context of the model scores
+GRP_BASE = ["fz_z", "fzr_z", "g2_z", "fwd_z", "frag_z"]
+GRP_FEATURES = [f"{c}_frank" for c in GRP_BASE] + [f"{c}_fgap" for c in GRP_BASE] + ["n_same_formula"]
+
+
+def formula_group_features(cols, qid, fid):
+    """Rank inside the (molecule, neutral formula) group (1 = best, ties share the best rank), value minus the group's
+    best, and the group size, for each per-molecule z column in GRP_BASE (k18: most misses have only same-formula
+    isomers above the truth; the ranker had no within-formula view of the model scores). cols: name -> values (rows
+    aligned; NaN -> 0 as in the z columns); qid: molecule per row (None = one molecule); fid: formula id per row
+    (subform.FormulaTable.fid[pid]). -> (n, len(GRP_FEATURES)) float32."""
+    import pandas as pd
+    fid = np.asarray(fid, np.int64)
+    n = len(fid)
+    qid = np.zeros(n, np.int64) if qid is None else np.asarray(qid, np.int64)
+    _, g = np.unique(qid * (int(fid.max(initial=0)) + 1) + fid, return_inverse=True)
+    d = pd.DataFrame({"g": g})
+    out = np.zeros((n, len(GRP_FEATURES)), np.float32)
+    k = len(GRP_BASE)
+    for j, c in enumerate(GRP_BASE):
+        d["v"] = np.nan_to_num(np.asarray(cols[c], np.float64), nan=0.0)
+        gb = d.groupby("g").v
+        out[:, j] = gb.rank(method="min", ascending=False).values
+        out[:, k + j] = d.v.values - gb.transform("max").values
+    out[:, 2 * k] = np.bincount(g)[g]
+    return out

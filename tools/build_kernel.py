@@ -4,6 +4,9 @@
     kaggle kernels push -p kaggle/k01_cache/build
     python tools/build_kernel.py k07_features2:3  -> kaggle/k07_features2/build_s{0,1,2}/  (3 shard kernels <slug>-s<i>;
                                                      a cell `SHARD, N_SHARDS = i, 3` is injected after the boot cell)
+    python tools/build_kernel.py k36_submit7 --define 'VARIANT="both|hybm:0.7:5+nogen"'
+                                                  -> the line starting with 'VARIANT = ' in main.py is replaced (must
+                                                     exist exactly once; the old trailing comment is dropped)
 kernel-metadata.json may carry "shard_kernel_sources": {"<i>": [...]}: extra kernel sources for shard i only
 (e.g. a later variant that reads an earlier shard's output); the key is removed from the pushed metadata.
 
@@ -13,6 +16,7 @@ notebook runs exactly the source it was built from (sha printed at runtime).
 """
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -68,7 +72,17 @@ def to_cell(kind, body):
     return c
 
 
-def build(kernel, shard=None, n_shards=1):
+def apply_defines(text, defines):
+    """Replace the 'NAME = ...' line of each NAME=VALUE in defines (exactly one such line per name)."""
+    for d in defines:
+        name, _, value = d.partition("=")
+        pat = re.compile(rf"^{re.escape(name.strip())} = .*$", re.M)
+        assert len(pat.findall(text)) == 1, f"--define {name}: need exactly one line '{name} = ...'"
+        text = pat.sub(lambda m: f"{name.strip()} = {value.strip()}  # --define", text)
+    return text
+
+
+def build(kernel, shard=None, n_shards=1, defines=()):
     kdir = ROOT / "kaggle" / kernel
     meta = json.loads((kdir / "kernel-metadata.json").read_text())
     extra = meta.pop("shard_kernel_sources", {})
@@ -83,7 +97,7 @@ def build(kernel, shard=None, n_shards=1):
     cells = [to_cell("code", boot)]
     if shard is not None:
         cells.append(to_cell("code", f"SHARD, N_SHARDS = {shard}, {n_shards}"))
-    cells +=[to_cell(k, b) for k, b in split_cells((kdir / "main.py").read_text())]
+    cells += [to_cell(k, b) for k, b in split_cells(apply_defines((kdir / "main.py").read_text(), defines))]
     nb = {"cells": cells, "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python",
                                                       "name": "python3"},
                                        "language_info": {"name": "python"}},
@@ -92,14 +106,19 @@ def build(kernel, shard=None, n_shards=1):
     meta["code_file"] = f"{slug}.ipynb"
     (out / meta["code_file"]).write_text(json.dumps(nb, indent=1))
     (out / "kernel-metadata.json").write_text(json.dumps(meta, indent=1))
-    print(f"{kernel}: {len(cells)} cells, src sha {sha} -> {out}")
+    print(f"{kernel}: {len(cells)} cells, src sha {sha} -> {out}" + (f" | defines {list(defines)}" if defines else ""))
 
 
 if __name__ == "__main__":
-    for arg in sys.argv[1:]:
+    args, defines = sys.argv[1:], []
+    while "--define" in args:
+        i = args.index("--define")
+        defines.append(args[i + 1])
+        del args[i:i + 2]
+    for arg in args:
         name, _, n = arg.partition(":")
         if n:
             for i in range(int(n)):
-                build(name, i, int(n))
+                build(name, i, int(n), defines)
         else:
-            build(name)
+            build(name, defines=defines)

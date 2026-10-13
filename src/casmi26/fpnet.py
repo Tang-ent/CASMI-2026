@@ -398,7 +398,7 @@ def load_checked(name="fpnet.pt", min_epoch=10, threads=2):
 # ---------------------------------------------------------------------------------------------- training loop
 def train(C, P, holdout_pids, val_queries, out_path, frac=1.0, epochs=None, budget_secs=10.5 * 3600,
           extra_val=None, log=print, seed=0, track=None, select="best", eval_every=1, fp=None, nbits=None,
-          resume=None):
+          resume=None, init=None):
     """Train on the non-holdout spectra (all of them, or the v2 per-epoch draw); validate (window MRR on
     val_queries and extra_val) every `eval_every` epochs and on the last one. Returns the history list.
     select="best": out_path = the best checkpoint by val MRR (k06); select="last": out_path = the last epoch (v2,
@@ -407,7 +407,9 @@ def train(C, P, holdout_pids, val_queries, out_path, frac=1.0, epochs=None, budg
     track: optional casmi26.track.Run; losses every 500 steps and the epoch records are logged to it.
     fp / nbits (M6 k28): packed target fingerprints per pid and their bit count (default P.fp, chem.FP_BITS).
     Every epoch also writes the full training state to <out>_state.pt (ckpt); resume=<that path> continues after its
-    epoch with the same cfg (the time budget counts from the resumed start)."""
+    epoch with the same cfg (the time budget counts from the resumed start).
+    init (M7 k39): a checkpoint whose weights start the network (same nbits); the optimizer, the warmup and the cosine
+    start fresh (a warm restart). Ignored when resuming (the state has the weights)."""
     import threading
     import queue
 
@@ -422,6 +424,11 @@ def train(C, P, holdout_pids, val_queries, out_path, frac=1.0, epochs=None, budg
     nbits = nbits or chem.FP_BITS
     fp = P.fp if fp is None else fp
     net = build_model(nbits).to(dev)
+    if init and not resume:
+        ck0 = torch.load(init, map_location="cpu", weights_only=False)
+        assert ck0["nbits"] == nbits, f"init {init} has {ck0['nbits']} bits, training {nbits}"
+        net.load_state_dict(ck0["model"])
+        log(f"[fpnet] warm start from {init} (epoch {ck0.get('epoch')})")
     opt = torch.optim.AdamW(net.parameters(), lr=Cfg.lr, weight_decay=Cfg.wd)
     probe = D.epoch_index(np.random.default_rng(seed + 12345))  # epoch size (the draw sizes are fixed)
     steps_per_epoch = max(1, len(probe) // Cfg.batch)

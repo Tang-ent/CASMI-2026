@@ -349,6 +349,67 @@ PY
         -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro -v "$D/data/work":/kaggle/input/k01:ro \
         -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k14":/kaggle/input/k14:ro \
         -v "$D/k15_s1":/kaggle/input/k15:ro -v "$D/k20":/kaggle/input/k20:ro -v "$D/k26":/kaggle/input/k26:ro ;;
+    k37)
+      # M7 P1 G2 v2: 30 steps of 4 spectra x (1 + 4), monitor every 10, wide window, 40 queries (agreement off for
+      # k15 / k20); the k29 smoke g2.pt as v1 (comb3(v1) must reproduce the k29 smoke ranks); needs the k14, k15 (s1),
+      # k20, k26 and k29 smoke outputs; rdkit from out/ds_wheels
+      py=$D/k37.py
+      nb "$ROOT/kaggle/k37_g2v2/build/casmi26-k37-g2v2.ipynb" "$py"
+      sed -i 's/^TOTAL_STEPS = 180000 /TOTAL_STEPS = 30 /; s/^BATCH, K_NEG, WORKERS = None, None, None /BATCH, K_NEG, WORKERS = 4, 4, 2 /; s/^FIT = None /FIT = (5, 10) /; s/^PPM = 10.0/PPM = 4000.0/; s/^N_BOOT = 2000/N_BOOT = 200/; s/^MIN_AGREE = 0.98 /MIN_AGREE = 0.0 /; s/^MAX_QUERIES = None /MAX_QUERIES = 40 /; s/^MONITOR_EVERY = 20000 /MONITOR_EVERY = 10 /; s/^GRAPH_WORKERS = 4/GRAPH_WORKERS = 2/' "$py"
+      grep -q "^TOTAL_STEPS = 30 " "$py" && grep -q "^MIN_AGREE = 0.0 " "$py" && grep -q "^MAX_QUERIES = 40 " "$py" \
+        && grep -q "^MONITOR_EVERY = 10 " "$py" || { echo "smoke patch did not apply to k37"; exit 1; }
+      TAIL=${TAIL:-30} run_kernel k37 "$py" "$D/k37" --memory 6g -e PYTHONUNBUFFERED=1 \
+        -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro -v "$D/data/work":/kaggle/input/k01:ro \
+        -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k14":/kaggle/input/k14:ro \
+        -v "$D/k15_s1":/kaggle/input/k15:ro -v "$D/k20":/kaggle/input/k20:ro -v "$D/k26":/kaggle/input/k26:ro \
+        -v "$D/k29":/kaggle/input/k29:ro ;;
+    k35)
+      # M7 evaluation on the k30 smoke output (v2a FPNet) with the k26 smoke formulas; CPU
+      nb "$ROOT/kaggle/k35_eval7/build/casmi26-k35-eval7.ipynb" "$D/k35.py"
+      sed -i 's/^N_BOOT = 2000/N_BOOT = 200/; s/^EXPECT_VARIANT = "v2b"/EXPECT_VARIANT = "v2a"/' "$D/k35.py"
+      grep -q '^EXPECT_VARIANT = "v2a"' "$D/k35.py" || { echo "smoke patch did not apply to k35"; exit 1; }
+      M=(); for i in 0 1 2 3; do M+=(-v "$D/k30_s$i":/kaggle/input/k30s$i:ro); done
+      TAIL=${TAIL:-30} run_kernel k35 "$D/k35.py" "$D/k35" --memory 6g "${M[@]}" -v "$D/data/pool":/kaggle/input/k05:ro \
+        -v "$D/k26":/kaggle/input/k26:ro ;;
+    k36)
+      # M7 submission by variant name (k35 smoke rankers, k31's for the "both" columns): (1) the k32 smoke variant -> submission_raw.csv must equal the
+      # k32 smoke submission (existing path unchanged), (2) hybb without generation, (3) hybi with S2; CPU unless GPU=1;
+      # needs the k15 (s0), k20, k21, k25, k26, k28, k29, k31, k32 and k35 smoke outputs
+      nb "$ROOT/kaggle/k36_submit7/build/casmi26-k36-submit7.ipynb" "$D/k36.py"
+      n=0
+      for v in "both_fprich_g2|hybm:0.7:2+gen:S3:0.7:rk" "both|hybb:0.7:0.8:5:10+nogen" "both_fprich_g2|hybi:0.7:0.8:5+gen:S2:0.7:rk"; do
+        n=$((n + 1)); py=$D/k36_$n.py
+        cp "$D/k36.py" "$py"
+        sed -i "s/^VARIANT = .*/VARIANT = \"$v\"/; s/^REQUIRE_CUDA = True /REQUIRE_CUDA = False /; s/^GRAPH_WORKERS = 4/GRAPH_WORKERS = 2/" "$py"
+        grep -qF "VARIANT = \"$v\"" "$py" && grep -q "^REQUIRE_CUDA = False " "$py" || { echo "smoke patch did not apply to k36"; exit 1; }
+        TAIL=${TAIL:-4} run_kernel "k36 $v" "$py" "$D/k36_$n" --memory 6g "${IN_DATA[@]}" -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro \
+          -v "$D/k15_s0":/kaggle/input/k15:ro -v "$D/k20":/kaggle/input/k20:ro -v "$D/k21":/kaggle/input/k21:ro \
+          -v "$D/k25":/kaggle/input/k25:ro -v "$D/k26":/kaggle/input/k26:ro -v "$D/k28":/kaggle/input/k28:ro \
+          -v "$D/k29":/kaggle/input/k29:ro -v "$D/k31":/kaggle/input/k31:ro -v "$D/k35":/kaggle/input/k35:ro
+        check_sub "$D/k36_$n/submission.csv"
+      done
+      cmp "$D/k36_1/submission_raw.csv" "$D/k32/submission.csv" && echo "k36 (k32 variant) raw submission == k32 smoke submission"
+      # (4) the k35 smoke rankers: same-formula columns, the lt08 ranker, interleave, GEN_EXTRA generation ranker
+      py=$D/k36_4.py; v="both_fprich_g2_grp.lt08|hybi:0.7:0.8:5+gen:S3:0.7:rkx"
+      cp "$D/k36.py" "$py"
+      sed -i "s/^VARIANT = .*/VARIANT = \"$v\"/; s/^REQUIRE_CUDA = True /REQUIRE_CUDA = False /; s/^GRAPH_WORKERS = 4/GRAPH_WORKERS = 2/" "$py"
+      TAIL=${TAIL:-4} run_kernel "k36 $v" "$py" "$D/k36_4" --memory 6g "${IN_DATA[@]}" -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro \
+        -v "$D/k15_s0":/kaggle/input/k15:ro -v "$D/k20":/kaggle/input/k20:ro -v "$D/k21":/kaggle/input/k21:ro \
+        -v "$D/k25":/kaggle/input/k25:ro -v "$D/k26":/kaggle/input/k26:ro -v "$D/k28":/kaggle/input/k28:ro \
+        -v "$D/k29":/kaggle/input/k29:ro -v "$D/k31":/kaggle/input/k31:ro -v "$D/k35":/kaggle/input/k35:ro
+      check_sub "$D/k36_4/submission.csv"
+      python3 -c "import json; [print(n, (lambda j: (j['eval'], j['stats'], j['local']))(json.load(open(f'$D/k36_{n}/variant.json')))) for n in (1, 2, 3, 4)]" ;;
+    k39)
+      # M7 P1 fprich warm restart: CPU, batch 32, 40 steps from the k28 smoke fprich.pt (its ranks must reproduce the k28
+      # smoke ranks), wide window; needs the k14, k15 (s1), k26 and k28 smoke outputs
+      py=$D/k39.py
+      nb "$ROOT/kaggle/k39_fprich2/build/casmi26-k39-fprich2.ipynb" "$py"
+      sed -i 's/^TOTAL_STEPS = None /TOTAL_STEPS = 40 /; s/^PPM = 10.0/PPM = 4000.0/; s/^N_BOOT = 2000/N_BOOT = 200/; s/^MIN_AGREE = 0.98 /MIN_AGREE = 0.0 /; s/^BATCH = None /BATCH = 32 /' "$py"
+      grep -q "^TOTAL_STEPS = 40 " "$py" && grep -q "^MIN_AGREE = 0.0 " "$py" && grep -q "^BATCH = 32 " "$py" || { echo "smoke patch did not apply to k39"; exit 1; }
+      TAIL=${TAIL:-25} run_kernel k39 "$py" "$D/k39" --memory 6g -e PYTHONUNBUFFERED=1 -v "$D/data/work":/kaggle/input/k01:ro \
+        -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k14":/kaggle/input/k14:ro \
+        -v "$D/k15_s1":/kaggle/input/k15:ro -v "$D/k26":/kaggle/input/k26:ro -v "$D/k28":/kaggle/input/k28:ro
+      grep -E "agreement|warm start|gate E2" "$D/k39/run.log" ;;
     k26)
       # M6 pool formulas + rich fingerprints of the smoke pool (rdkit from out/ds_wheels as the casmi26-wheels dataset)
       nb "$ROOT/kaggle/k26_fp2/build/casmi26-k26-fp2.ipynb" "$D/k26.py"

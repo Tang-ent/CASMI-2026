@@ -551,12 +551,14 @@ def example_batch(C, D, G, NEG, idx, k_neg, prng):
     return bt, stats
 
 
-def train(C, D, G, NEG, out_path, budget_secs=6.5 * 3600, log=print, seed=0, track=None, resume=None):
+def train(C, D, G, NEG, out_path, budget_secs=6.5 * 3600, log=print, seed=0, track=None, resume=None, monitor=None,
+          monitor_every=0):
     """Train G2 on the TrainData draw D (fpnet.Cfg v2b settings) with same-formula negatives NEG. Batch i is a fixed
     slice of consecutive epoch draws and its negatives come from a generator seeded with (seed, i); producer w builds
     the steps i with i % workers == w and the loop reads them in step order, so a resumed run sees the same batches as
     an uninterrupted one. Saves the weights (out_path) and the training state (ckpt) every Cfg.save_every steps and at
-    the end. Returns the history list."""
+    the end. monitor(net, step), if given, is called every monitor_every steps (after the save; net in eval mode, no
+    effect on the batches or the random state) for report-only validation. Returns the history list."""
     import queue
     import threading
 
@@ -667,6 +669,10 @@ def train(C, D, G, NEG, out_path, budget_secs=6.5 * 3600, log=print, seed=0, tra
             n_log, te = 0, time.time()
         if step % Cfg.save_every == 0:
             save()
+        if monitor is not None and monitor_every and step % monitor_every == 0:
+            net.eval()
+            monitor(net, step)
+            net.train()
     if time.time() - t0 > budget_secs:
         log("[g2] time budget reached")
     save()

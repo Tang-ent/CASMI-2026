@@ -1,0 +1,9 @@
+date,label,variant,submission_ref,lb_public,A,B_A,B_N,G_N,source
+2026-10-04,M1,gate:0.9,,0.205,0.9238,0.3311,0.3557,0,k13 calib.csv
+2026-10-05,M2,gfz:0.7:5,,0.220,0.9231,0.3701,0.4227,0,k13 calib.csv
+2026-10-05,M2.1,hyb:0.6,,0.272,0.9353,0.4359,0.5074,0,k13 calib.csv
+2026-10-05,M2.2,hybm:0.7:2,,0.285,0.9215,0.5164,0.5363,0,k13 calib.csv
+2026-10-06,S',hybm:0.8:10 + PubChem S',56882680,0.251,0.9263,0.4793,0.4665,0,k13 calib.csv (in-COCONUT proxies)
+2026-10-09,k17,route:hard:0.7:5 (v2b),,0.293,0.878,0.667,0.573,0,casmi26-yardstick memory (calibration point 6)
+2026-10-11,k24 v1,both|hybm:0.7:2+gen:S3:0.7:rk,57071905,0.310,0.9339,0.5337,0.5398,0.0495,k31 reference recomputed
+2026-10-13,k32 v2,both_fprich_g2|hybm:0.7:5+gen:S3:0.7:rk,57120836,0.327,0.9391,0.5391,0.5618,0.0495,k31 rule6.csv

@@ -133,6 +133,25 @@ def canonical(smiles):
         return None
 
 
+def parent_smiles(smiles):
+    """Submission hygiene (M7): a multi-component SMILES (salt / mixture, e.g. '...Cl' or '[Na+]...') can never match,
+    because the official metric compares heavy-atom compositions and the answers are single-component. -> the largest
+    component, uncharged where possible (None if RDKit cannot parse it); single-component SMILES are returned as is."""
+    if not isinstance(smiles, str) or "." not in smiles:
+        return smiles
+    from rdkit.Chem.MolStandardize import rdMolStandardize
+    r = _rdkit()
+    try:
+        m = r["Chem"].MolFromSmiles(smiles)
+        if m is None:
+            return None
+        m = rdMolStandardize.LargestFragmentChooser().choose(m)
+        m = rdMolStandardize.Uncharger().uncharge(m)
+        return r["Chem"].MolToSmiles(m)
+    except Exception:
+        return None
+
+
 def score_key(smiles):
     """Metric key: InChIKey14 after RDKit tautomer canonicalisation (None on failure)."""
     c = canonical(smiles)
