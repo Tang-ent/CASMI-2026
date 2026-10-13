@@ -371,6 +371,14 @@ PY
       M=(); for i in 0 1 2 3; do M+=(-v "$D/k30_s$i":/kaggle/input/k30s$i:ro); done
       TAIL=${TAIL:-30} run_kernel k35 "$D/k35.py" "$D/k35" --memory 6g "${M[@]}" -v "$D/data/pool":/kaggle/input/k05:ro \
         -v "$D/k26":/kaggle/input/k26:ro ;;
+    k40)
+      # M7 P2 slot cost of the PubChem S' side list on the k30 smoke output (v2a), k26 formulas, the smoke S' part; CPU
+      nb "$ROOT/kaggle/k40_pc_cost/build/casmi26-k40-pc-cost.ipynb" "$D/k40.py"
+      sed -i 's/^N_BOOT = 2000/N_BOOT = 200/; s/^EXPECT_VARIANT = "v2b"/EXPECT_VARIANT = "v2a"/' "$D/k40.py"
+      grep -q '^EXPECT_VARIANT = "v2a"' "$D/k40.py" || { echo "smoke patch did not apply to k40"; exit 1; }
+      M=(); for i in 0 1 2 3; do M+=(-v "$D/k30_s$i":/kaggle/input/k30s$i:ro); done
+      TAIL=${TAIL:-12} run_kernel k40 "$D/k40.py" "$D/k40" --memory 6g "${M[@]}" -v "$D/data/pool":/kaggle/input/k05:ro \
+        -v "$D/k26":/kaggle/input/k26:ro -v "$D/pcside":/kaggle/input/pcside:ro ;;
     k36)
       # M7 submission by variant name (k35 smoke rankers, k31's for the "both" columns): (1) the k32 smoke variant -> submission_raw.csv must equal the
       # k32 smoke submission (existing path unchanged), (2) hybb without generation, (3) hybi with S2; CPU unless GPU=1;
@@ -398,7 +406,35 @@ PY
         -v "$D/k25":/kaggle/input/k25:ro -v "$D/k26":/kaggle/input/k26:ro -v "$D/k28":/kaggle/input/k28:ro \
         -v "$D/k29":/kaggle/input/k29:ro -v "$D/k31":/kaggle/input/k31:ro -v "$D/k35":/kaggle/input/k35:ro
       check_sub "$D/k36_4/submission.csv"
-      python3 -c "import json; [print(n, (lambda j: (j['eval'], j['stats'], j['local']))(json.load(open(f'$D/k36_{n}/variant.json')))) for n in (1, 2, 3, 4)]" ;;
+      # (5) = (4) + the PubChem S' side list (P5, gate 0.7) from the smoke S' part (tools/smoke/setup_pcside.py); without
+      # S' strings, the first k items of every row are the same set as in (4) (slots are absolute positions, so an S'
+      # item can move a pool item past a generation slot: the order may change, the content may not)
+      [ -f "$D/pcside/pc_pool.parquet" ] || { echo "run tools/smoke/setup_pcside.py first (see its docstring)"; exit 1; }
+      py=$D/k36_5.py; v="both_fprich_g2_grp.lt08|hybi:0.7:0.8:5+gen:S3:0.7:rkx+pc:P5:0.7"
+      cp "$D/k36.py" "$py"
+      sed -i "s/^VARIANT = .*/VARIANT = \"$v\"/; s/^REQUIRE_CUDA = True /REQUIRE_CUDA = False /; s/^GRAPH_WORKERS = 4/GRAPH_WORKERS = 2/; s/^PC_MAX_CAND = 300 /PC_MAX_CAND = 30 /" "$py"
+      grep -q "^PC_MAX_CAND = 30 " "$py" || { echo "smoke patch did not apply to k36 (5)"; exit 1; }
+      TAIL=${TAIL:-4} run_kernel "k36 $v" "$py" "$D/k36_5" --memory 6g "${IN_DATA[@]}" -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro \
+        -v "$D/k15_s0":/kaggle/input/k15:ro -v "$D/k20":/kaggle/input/k20:ro -v "$D/k21":/kaggle/input/k21:ro \
+        -v "$D/k25":/kaggle/input/k25:ro -v "$D/k26":/kaggle/input/k26:ro -v "$D/k28":/kaggle/input/k28:ro \
+        -v "$D/k29":/kaggle/input/k29:ro -v "$D/k31":/kaggle/input/k31:ro -v "$D/k35":/kaggle/input/k35:ro \
+        -v "$D/pcside":/kaggle/input/pcside:ro
+      check_sub "$D/k36_5/submission.csv"
+      docker run --rm -v "$D":/d:ro "$IMG" python -c "
+import pandas as pd
+pc = set(pd.read_parquet('/d/pcside/pc_pool.parquet', columns=['smiles']).smiles)
+a = pd.read_csv('/d/k36_4/submission_raw.csv').set_index('molecule_id').smiles.str.split(';')
+b = pd.read_csv('/d/k36_5/submission_raw.csv').set_index('molecule_id').smiles.str.split(';')
+n_pc = b.map(lambda x: sum(s in pc for s in x[:25]))
+same = []
+for x, y in zip(a.values, b.values):
+    xx, yy = [s for s in x[:25] if s not in pc], [s for s in y[:25] if s not in pc]
+    k = min(len(xx), len(yy))
+    same.append(set(xx[:k]) == set(yy[:k]))
+print(f'k36 (5): S\' items in {int((n_pc > 0).sum())} rows ({int(n_pc.sum())} in all); rows with the same content as (4): {sum(same)}/{len(same)}')
+assert all(same) and n_pc.sum() > 0
+" 2>&1 | grep -v -i warn
+      python3 -c "import json; [print(n, (lambda j: (j['eval'], j['stats'], j['local']))(json.load(open(f'$D/k36_{n}/variant.json')))) for n in (1, 2, 3, 4, 5)]" ;;
     k39)
       # M7 P1 fprich warm restart: CPU, batch 32, 40 steps from the k28 smoke fprich.pt (its ranks must reproduce the k28
       # smoke ranks), wide window; needs the k14, k15 (s1), k26 and k28 smoke outputs
@@ -410,6 +446,18 @@ PY
         -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro -v "$D/k14":/kaggle/input/k14:ro \
         -v "$D/k15_s1":/kaggle/input/k15:ro -v "$D/k26":/kaggle/input/k26:ro -v "$D/k28":/kaggle/input/k28:ro
       grep -E "agreement|warm start|gate E2" "$D/k39/run.log" ;;
+    k38)
+      # M7 P1 column recompute: v1 (k29 / k28 smoke models) must reproduce the k30 smoke columns, then the k37 / k39
+      # smoke models (g2v2.pt, fprich2.pt) give the new columns; CPU; needs the k26, k28, k29, k30, k37 and k39 smoke outputs
+      py=$D/k38.py
+      nb "$ROOT/kaggle/k38_recols/build/casmi26-k38-recols.ipynb" "$py"
+      sed -i 's/^NEW = {"g2": "g2v2.pt", "fprich": None} /NEW = {"g2": "g2v2.pt", "fprich": "fprich2.pt"} /; s/^GRAPH_WORKERS = 4/GRAPH_WORKERS = 2/' "$py"
+      grep -q '^NEW = {"g2": "g2v2.pt", "fprich": "fprich2.pt"} ' "$py" || { echo "smoke patch did not apply to k38"; exit 1; }
+      M=(); for i in 0 1 2 3; do M+=(-v "$D/k30_s$i":/kaggle/input/k30s$i:ro); done
+      TAIL=${TAIL:-20} run_kernel k38 "$py" "$D/k38" --memory 6g "${IN_DATA[@]}" "${M[@]}" \
+        -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro -v "$D/k26":/kaggle/input/k26:ro \
+        -v "$D/k28":/kaggle/input/k28:ro -v "$D/k29":/kaggle/input/k29:ro -v "$D/k37":/kaggle/input/k37:ro \
+        -v "$D/k39":/kaggle/input/k39:ro ;;
     k26)
       # M6 pool formulas + rich fingerprints of the smoke pool (rdkit from out/ds_wheels as the casmi26-wheels dataset)
       nb "$ROOT/kaggle/k26_fp2/build/casmi26-k26-fp2.ipynb" "$D/k26.py"

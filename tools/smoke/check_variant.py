@@ -45,3 +45,37 @@ for q in (1, 2):
     m = qid == q
     assert np.array_equal(S.formula_group_features({c: x[m] for c, x in cols.items()}, None, fid[m]), F[m])
 print("formula group features: PASS")
+
+# slots: merge (submission) and shifted_rank / slot_rank (evaluation) agree; k31's shift / g_pos for S3 alone
+from casmi26 import slots as SL  # noqa: E402
+
+S3, P5 = SL.SLOT_SETS["S3"], SL.SLOT_SETS["P5"]
+main = [f"m{i}" for i in range(1, 41)]
+for ng, npc in [(0, 0), (8, 0), (3, 5), (8, 2), (0, 5), (12, 9)]:
+    gen_items, pc_items = [f"g{i}" for i in range(1, ng + 1)], [f"p{i}" for i in range(1, npc + 1)]
+    out = SL.merge(main, [(S3, gen_items[:len(S3)]), (P5, pc_items[:len(P5)])])
+    occ = SL.occupied([(S3, ng), (P5, npc)])
+    for r in (1, 2, 3, 4, 5, 9, 13, 20, 30):
+        assert out.index(f"m{r}") + 1 == SL.shifted_rank(r, occ), (ng, npc, r)
+    for k in range(1, ng + 1):
+        exp = out.index(f"g{k}") + 1 if f"g{k}" in out[:60] and k <= len(S3) else np.inf
+        assert SL.slot_rank(k, S3, ng) == (exp if k <= len(S3) else np.inf)
+    # k31 (S3 only): p = r; for each of the first m slots in order: if slot <= p: p += 1
+    if npc == 0:
+        for r in (1, 3, 7, 22):
+            p = float(r)
+            for j, sl in enumerate(S3):
+                p = p + 1 if (j < min(ng, len(S3)) and sl <= p) else p
+            assert p == SL.shifted_rank(r, occ)
+print("slots: PASS")
+
+v = S.parse_variant("both_fprich_g2_grp|hybi:0.7:0.8:5+gen:S3:0.7:rkx+pc:P5:0.7")
+assert v["pc"] == dict(slots_name="P5", slots=[5, 10, 14, 20, 25], gate=0.7) and v["gen"]["slots_name"] == "S3"
+assert S.parse_variant("both|hybm:0.7:5+nogen+pc:P2:0.7")["gen"] is None
+assert S.parse_variant("both|hybm:0.7:5+gen:S3:0.7:rk")["pc"] is None
+try:
+    S.parse_variant("both|hybm:0.7:5+gen:S2:0.7:rk+pc:P5:0.7")
+    raise SystemExit("S2 + P5 overlap not detected")
+except AssertionError:
+    pass
+print("parse_variant with pc: PASS")

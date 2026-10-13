@@ -451,18 +451,23 @@ def route_score(X, rk, p, w, mode, t=0.5, qid=None):
 
 
 # ---------------------------------------------------------------- M7: pool-side scoring variants by name
-SLOT_SETS = {"S5": [5, 10, 15, 20, 25], "S3": list(range(3, 25, 3)), "S2": list(range(2, 25, 2)), "S10": [10, 20]}
+from .slots import SLOT_SETS  # noqa: E402（M7: 枠の定義は slots.py に一本化）
 
 
 def parse_variant(name):
-    """'<cols>|<score>+gen:<slots>:<gate>:<gen score>' or '<cols>|<score>+nogen' (k31 / k35 model names) ->
-    dict(cols, score=(kind, params), gen=None or dict(slots_name, slots, gate, score)).
+    """'<cols>|<score>+gen:<slots>:<gate>:<gen score>' or '<cols>|<score>+nogen' (k31 / k35 model names), optionally
+    followed by '+pc:<slots>:<gate>' (M7 P2: the PubChem S' side list) ->
+    dict(cols, score=(kind, params), gen=None or dict(slots_name, slots, gate, score), pc=None or dict(slots_name,
+    slots, gate)).
     Scores: hybm:tau:w (blend_score), hybb:tau_lo:tau_hi:w_lo:w_hi (blend_score with w_hi for molecules whose
     lib_grp_max is in [tau_lo, tau_hi), w_lo below, the rule from tau_hi up), hybi:tau_lo:tau_hi:w (rule order and
     ranker order interleaved in [tau_lo, tau_hi), see variant_order)."""
     cols, _, rest = name.partition("|")
     assert cols and rest, name
-    score, _, g = rest.partition("+")
+    score, *parts = rest.split("+")
+    g = next((x for x in parts if x.startswith(("gen:", "nogen"))), "")
+    pc = next((x for x in parts if x.startswith("pc:")), None)
+    assert len(parts) == bool(g) + (pc is not None), f"unknown parts in {name!r}"
     kind, *a = score.split(":")
     n_par = {"hybm": 2, "hybb": 4, "hybi": 3}
     assert kind in n_par and len(a) == n_par[kind], f"unknown score variant {score!r}"
@@ -475,7 +480,12 @@ def parse_variant(name):
         tag, slots_name, gate, gscore = g.split(":")
         assert tag == "gen" and slots_name in SLOT_SETS and gscore in ("rk", "rkx"), f"unknown generation {g!r}"
         gen = dict(slots_name=slots_name, slots=list(SLOT_SETS[slots_name]), gate=float(gate), score=gscore)
-    return dict(cols=cols, score=(kind, a), gen=gen)
+    if pc is not None:
+        _, slots_name, gate = pc.split(":")
+        assert slots_name in SLOT_SETS, f"unknown slots {pc!r}"
+        pc = dict(slots_name=slots_name, slots=list(SLOT_SETS[slots_name]), gate=float(gate))
+        assert not gen or not set(gen["slots"]) & set(pc["slots"]), f"{name}: generation and PubChem slots overlap"
+    return dict(cols=cols, score=(kind, a), gen=gen, pc=pc)
 
 
 def _interleave(a, b):

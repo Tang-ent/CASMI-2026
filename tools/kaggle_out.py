@@ -14,14 +14,22 @@ from kagglesdk.kernels.types.kernels_api_service import ApiListKernelSessionOutp
 
 
 def list_output(kernel):
-    """Output listing of the kernel's latest version: .files (file_name, url) and .log."""
+    """Output listing of the kernel's latest version: .files (file_name, url; all pages) and .log."""
     owner, slug = kernel.split("/")
     api = KaggleApi()
     api.authenticate()
     with api.build_kaggle_client() as k:
         req = ApiListKernelSessionOutputRequest()
-        req.user_name, req.kernel_slug = owner, slug
-        return k.kernels.kernels_api_client.list_kernel_session_output(req)
+        req.user_name, req.kernel_slug, req.page_size = owner, slug, 100
+        resp = k.kernels.kernels_api_client.list_kernel_session_output(req)
+        files, token = list(resp.files), resp.next_page_token
+        while token:  # the listing is paged (about 20 files per page by default)
+            req.page_token = token
+            r = k.kernels.kernels_api_client.list_kernel_session_output(req)
+            files += list(r.files)
+            token = r.next_page_token
+        resp.files = files
+        return resp
 
 
 def download(f, path):

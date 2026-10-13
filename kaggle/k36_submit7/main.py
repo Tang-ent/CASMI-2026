@@ -12,8 +12,9 @@
 # - 25 件に足りなければ質量の近いプールの構造で埋める（k24 と同じ）
 # - variant.json に案の名前、手元の評価の数字（評価の表にあれば）、src sha を残す（tools/wandb_lb.py が読む）
 # G2 のグラフ（プール全体）は CUDA を使い始める前に作る（multiprocessing の fork のため）。
+# - '+pc:<枠>:<門>'（M7 P2）: lib_grp_max < 門 の分子で、PubChem S' の窓の構造を pcside の点数で並べ、上位を枠（P5 / P2）に入れる
 # 入力: 競技データ、k01、k05、k05b、k15-s1、k20、k21、k25、k26（pool_fp2.npy、pool_formula.npz）、k31（と k35）、casmi26-fprich、
-# casmi26-g2、casmi26-wheels。
+# casmi26-g2、casmi26-wheels、casmi26-pubchem-part（+pc のときだけ使う）。
 
 # %%
 import glob
@@ -38,12 +39,13 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
-from casmi26 import cache, chem, fpnet, frag, fwd, g2, gen, harness, paths, pool, rank, search, subform
+from casmi26 import cache, chem, fpnet, frag, fwd, g2, gen, harness, paths, pcside, pool, rank, search, slots, subform
 
 T0 = time.time()
 VARIANT = "both_fprich_g2|hybm:0.8:5+gen:S3:0.7:rk"  # 提出の列の 1 番
 REQUIRE_CUDA = True  # fwd / fprich / G2 は k30 と同じ GPU で（手元の動作確認は False）
 GRAPH_WORKERS = 4
+PC_MAX_CAND = 300  # S' の窓が大きいときは fz の上位だけを採点する（pcside、計画 2026-10-14）
 V = search.parse_variant(VARIANT)
 print("variant:", VARIANT, V)
 tag = V["cols"]
@@ -75,9 +77,13 @@ if GEN:
     GEN_X = len(gen_cols) > len(gen.GEN_FEATURES)
     SLOTS, GATE = GEN["slots"], GEN["gate"]
     USE_RICH, USE_G2 = USE_RICH or GEN_X, USE_G2 or GEN_X
+PC = V["pc"]
+if PC:  # M7 P2: S' の点数は fzr と g2 を使う
+    USE_RICH = USE_G2 = True
 
 C = cache.Cache(cache.Cache.find_dir())
-P = pool.Pool(pool.Pool.find_dir())
+P = pool.Pool(pool.Pool.find_dir(), pubchem=False)  # S' は側の一覧だけ（プールには混ぜない）
+PCS = pcside.PubChemSide() if PC else None
 assert len(P) == P.n_base, "the PubChem part must not be attached"
 GR = g2.Graphs.build(P.smiles, GRAPH_WORKERS) if USE_G2 else None  # CUDA より先に（fork）
 FP2 = np.load(paths.find("pool_fp2.npy")) if USE_RICH else None
@@ -120,15 +126,16 @@ def pool_order(cand, X):
 
 
 def gen_order(specs, cand, info):
-    """Product SMILES of one molecule in the generation ranker's order."""
+    """Products of one molecule in the generation ranker's order -> (SMILES list, InChIKey14 list)."""
     z_rich = S.last["z_rich"]  # gen.for_query は S.features の直後に呼ぶ（S.last を使う）
     prods, Xg, _ = gen.for_query(S, specs, cand, info, fwd=FWD)
     if not prods:
-        return []
+        return [], []
     if GEN_X:
         Xg = np.column_stack([Xg, gen.extra_features(prods, specs, z_rich, G2M)])
     sc = rank.predict(gen_models, Xg.astype(np.float32))
-    return [prods[i]["smiles"] for i in np.argsort(-sc, kind="mergesort")]
+    o = np.argsort(-sc, kind="mergesort")
+    return [prods[i]["smiles"] for i in o], [prods[i]["key"] for i in o]
 
 
 COMP = paths.comp_dir()
@@ -139,29 +146,30 @@ print(f"test: {len(te):,} spectra / {te.molecule_id.nunique():,} molecules")
 # %%
 DEFAULT_ADDUCT = {1: "[M+H]+", -1: "[M-H]-"}
 rows, rows_raw = [], []
-stats = dict(ranked=0, no_candidates=0, no_mass=0, padded=0, gated=0, with_gen=0, gen_slotted=0, salt_fixed=0,
-             salt_dropped=0)
+stats = dict(ranked=0, no_candidates=0, no_mass=0, padded=0, gated=0, with_gen=0, gen_slotted=0, pc_gated=0,
+             pc_with=0, pc_slotted=0, salt_fixed=0, salt_dropped=0)
 for i, (mid, g) in enumerate(te.groupby("molecule_id", sort=False)):
     specs = harness.test_specs(g)
     cand, X, info = S.features(specs)
     order = pool_order(cand, X) if len(cand) else []
     stats["ranked" if order else "no_candidates"] += 1
     items = [P.smiles[p] for p in order]
+    inserts, g_keys = [], []
     if GEN and info["lib_max"] < GATE:
         stats["gated"] += 1
-        g_smi = gen_order(specs, cand, info) if len(cand) else []
+        g_smi, g_keys = gen_order(specs, cand, info) if len(cand) else ([], [])
         stats["with_gen"] += bool(g_smi)
-        m = min(len(g_smi), len(SLOTS))
-        stats["gen_slotted"] += m
-        slots, out, gi, pi = set(SLOTS[:m]), [], 0, 0
-        for pos in range(1, 26):
-            if pos in slots:
-                out.append(g_smi[gi])
-                gi += 1
-            elif pi < len(items):
-                out.append(items[pi])
-                pi += 1
-        items = out + items[pi:]  # 25 位より後ろはプール側の残り（衛生で抜けた分を埋める）
+        stats["gen_slotted"] += min(len(g_smi), len(SLOTS))
+        inserts.append((SLOTS, g_smi[:len(SLOTS)]))
+    if PC and len(cand) and info["lib_max"] < PC["gate"]:  # S' の側の一覧（生成物と同じ IK14 は飛ばす）
+        stats["pc_gated"] += 1
+        p_smi, _, _ = PCS.ranked(S, specs, info, fwd=FWD, fprich=(MR, None), g2=G2M, exclude_keys=g_keys,
+                                 max_cand=PC_MAX_CAND)
+        stats["pc_with"] += bool(p_smi)
+        stats["pc_slotted"] += min(len(p_smi), len(PC["slots"]))
+        inserts.append((PC["slots"], p_smi[:len(PC["slots"])]))
+    if inserts:
+        items = slots.merge(items, inserts)  # 25 位より後ろもプール側の順で残す（衛生で抜けた分を埋める）
     target = info["target"]
     if not np.isfinite(target):
         stats["no_mass"] += 1
