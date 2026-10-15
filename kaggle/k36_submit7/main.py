@@ -214,18 +214,18 @@ def write(rows, path):
 write(rows_raw, "submission_raw.csv")
 sub = write(rows, "submission.csv")
 local = {}
-try:
-    rt = pd.read_csv(f"{EV}/rule{VER}.csv").set_index("model")
+for v_, d_ in [(VER, EV)] + EVS:  # 選んだ評価の表を先に、無ければほかの表（k35 と k31 の同じ列の組のランカーは同じもの）
+    if local or not os.path.exists(f"{d_}/rule{v_}.csv"):
+        continue
+    rt = pd.read_csv(f"{d_}/rule{v_}.csv").set_index("model")
     # k35 は生成まで含む名前。k31 の表はプール側の名前だけで、生成は S3:0.7:rk に固定
-    names = [VARIANT] + ([VARIANT.split("+")[0]] if VARIANT.endswith("+gen:S3:0.7:rk") else [])
+    names = [VARIANT] + ([VARIANT.split("+")[0]] if VARIANT.endswith("+gen:S3:0.7:rk") and v_ == "6" else [])
     key = next((k for k in names if k in rt.index), None)
     if key:
         local = {k: float(rt.loc[key, k]) for k in ["A", "B_A", "B_N", "G_N", "dA", "dB_A", "dB_N", "dG_N",
                                                     "dA_lo", "dB_N_lo", "pred_lb_delta", "eligible", "report_only"]
                  if k in rt.columns}  # eligible = 選び方を通った案（False は較正のための提出）
-        local["eval_model"] = key
-except FileNotFoundError:
-    pass
+        local["eval_model"] = f"eval{v_} {key}"
 json.dump(dict(variant=VARIANT, parsed=V, eval=f"eval{VER}", local=local, stats=stats,
                src_sha=os.environ.get("CASMI26_SHA"), rdkit=rdkit.__version__), open("variant.json", "w"), indent=1)
 print("local eval of this pool side:", local)
