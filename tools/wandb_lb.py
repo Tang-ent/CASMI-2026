@@ -58,7 +58,7 @@ def main():
         if str(s.ref) not in known:
             loc = vj.get("local", {})
             row = [str(s.date)[:10], f"{kernel} v{version}", vj["variant"], s.ref, summ["lb_public"]] + \
-                  [loc.get(k, "") for k in ("A", "B_A", "B_N", "G_N")] + [f"{vj.get('eval')} {loc.get('eval_model', '')}"]
+                  [loc.get(k, "") for k in ("A", "B_A", "B_N", "G_N")] + [f"{vj.get('eval')} {loc.get('eval_model', '')}", summ["lb_public"]]
             with open(a.points, "a", newline="") as fh:
                 csv.writer(fh).writerow(row)
             print("appended to", a.points)
