@@ -505,6 +505,36 @@ assert all(same) and n_pc.sum() > 0
       TAIL=${TAIL:-25} run_kernel k34 "$py" "$D/k34" -v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro \
         -v "$D/data/work":/kaggle/input/k01:ro -v "$D/data/pool":/kaggle/input/k05:ro -v "$D/data/k05b":/kaggle/input/k05b:ro \
         -v "$D/k15_s1":/kaggle/input/k15:ro -v "$D/k26":/kaggle/input/k26:ro -v "$D/k33":/kaggle/input/k33:ro ;;
+    ext)
+      # M7 P3 ext.py: entropy similarity == the probe's, NaN convention of the columns, probe identity top-1 of GLACIER /
+      # ICEBERG within 0.02, score_candidates; needs out/ds_mspred_flat (casmi26-mspred) and the GPU (GPU=1 not required)
+      mkdir -p "$D/ext"
+      docker run --rm --network none --gpus all --memory 14g --shm-size 4g -v "$ROOT/src":/src:ro \
+        -v "$ROOT/out/ds_mspred_flat":/kaggle/input/casmi26-mspred:ro -v "$ROOT/out/ds_wheels":/wheels:ro -v "$D/ext":/w \
+        -v "$ROOT/tools/smoke/check_ext.py":/c.py:ro -e NUMBA_CACHE_DIR=/tmp/numba -e EXT_WORKERS=${EXT_WORKERS:-0} "$IMG" \
+        bash -c "pip install -q --no-index --find-links /wheels rdkit > /dev/null 2>&1; cd /w && python /c.py > /w/run.log 2>&1; \
+        rc=\$?; chown -R $U /w; exit \$rc" || { tail -30 "$D/ext/run.log"; exit 1; }
+      grep -E "^\(|ALL OK|FAILED" "$D/ext/run.log" ;;
+    k41)
+      # M7 P3-1 on the REAL inputs (out/m6_in, out/p3_in, out/ds_mspred_flat), 20 queries per set, GLACIER, local GPU
+      SMOKE=1 "$ROOT/tools/local/run_k41.sh" gl
+      L=$ROOT/out/p3_k41_gl_smoke/run.log
+      until grep -qE "^exit [0-9]+" "$L" 2>/dev/null; do sleep 5; done
+      grep -qE "^exit 0" "$L" || { tail -30 "$L"; exit 1; }
+      grep -E "^rows|^reference|^truth|^probe|part |^total" "$L" ;;
+    k42)
+      # M7 P3-2 eval on the REAL k30 / k35 inputs with the k41 smoke output as casmi26-p3-ext, 20 queries per set (CPU)
+      py=$D/k42.py
+      nb "$ROOT/kaggle/k42_eval8/build/casmi26-k42-eval8.ipynb" "$py"
+      sed -i 's/^N_BOOT = 2000/N_BOOT = 200/; s/^MAX_QUERIES = None /MAX_QUERIES = 20 /' "$py"
+      grep -q "^MAX_QUERIES = 20 " "$py" || { echo "smoke patch did not apply to k42"; exit 1; }
+      M=()
+      for s in casmi26-k30-features4-s0 casmi26-k30-features4-s1 casmi26-k30-features4-s2 casmi26-k30-features4-s3 casmi26-k35-eval7; do
+        M+=(-v "$ROOT/out/p3_in/$s":/kaggle/input/$s:ro)
+      done
+      TAIL=${TAIL:-6} run_kernel k42 "$py" "$D/k42" --memory 12g "${M[@]}" -v "$ROOT/out/m6_in/casmi26-k26-fp2":/kaggle/input/k26:ro \
+        -v "$ROOT/out/m6_in/casmi26-k05-pool":/kaggle/input/k05:ro -v "$ROOT/out/ds_mspred_flat":/kaggle/input/casmi26-mspred:ro \
+        -v "$ROOT/out/p3_k41_gl_smoke":/kaggle/input/casmi26-p3-ext:ro ;;
     *) echo "unknown step $step"; exit 1 ;;
   esac
 done

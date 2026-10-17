@@ -1,0 +1,42 @@
+#!/bin/bash
+# k41_ext on the local GPU in the Kaggle docker image (M7 P3-1, user decision 2026-10-17: GLACIER first, ICEBERG in
+# parallel / after). Same notebook as the Kaggle build; only WORKERS (GLACIER DataLoader workers, needs --shm-size)
+# and, for a smoke run, MAX_QUERIES differ.
+#   tools/local/run_k41.sh gl            # full run, output in out/p3_k41_gl
+#   SMOKE=1 tools/local/run_k41.sh gl    # 20 queries per set, output in out/p3_k41_gl_smoke
+#   re-running into an existing output directory resumes (finished query groups are skipped; run.log is rotated)
+# The container runs detached; follow it with tail -f <out>/run.log
+set -euo pipefail
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+KIND=${1:?usage: run_k41.sh gl|ice}
+SMOKE=${SMOKE:-0}
+WORKERS=${WORKERS:-4}
+OUT=$ROOT/out/p3_k41_$KIND$([ "$SMOKE" = 1 ] && echo _smoke || true)
+IMG=gcr.io/kaggle-gpu-images/python:latest
+U="$(id -u):$(id -g)"
+NAME=${NAME:-casmi26-k41-$KIND-$(date +%m%d%H%M)}
+mkdir -p "$OUT"
+if [ -e "$OUT/run.log" ]; then i=1; while [ -e "$OUT/run.log.$i" ]; do i=$((i + 1)); done; mv "$OUT/run.log" "$OUT/run.log.$i"; fi
+py=$OUT/k41.py
+python3 "$ROOT/tools/build_kernel.py" k41_ext --define "KIND = \"$KIND\"" > /dev/null
+python3 "$ROOT/tools/smoke/nb2py.py" "$ROOT/kaggle/k41_ext/build/casmi26-k41-ext.ipynb" "$py"
+for pat in "^KIND = \"$KIND\"" "^WORKERS = 0 " "^MAX_QUERIES = None " "^CHUNK = 20000 "; do
+  grep -q "$pat" "$py" || { echo "k41 script is not at the Kaggle defaults: $pat"; exit 1; }
+done
+sed -i "s/^WORKERS = 0 /WORKERS = $WORKERS /" "$py"
+[ "$SMOKE" = 1 ] && sed -i 's/^MAX_QUERIES = None /MAX_QUERIES = 20 /; s/^CHUNK = 20000 /CHUNK = 3000 /' "$py"
+MOUNTS=(-v "$ROOT/out/ds_wheels":/kaggle/input/casmi26-wheels:ro -v "$ROOT/out/ds_mspred_flat":/kaggle/input/casmi26-mspred:ro
+        -v "$ROOT/enveda-CASMI26-molecule-id-mass-spectra":/kaggle/input/enveda-CASMI26-molecule-id-mass-spectra:ro)
+for s in casmi26-k01-cache casmi26-k05-pool casmi26-k05b-massfix casmi26-k26-fp2; do
+  [ -d "$ROOT/out/m6_in/$s" ] || { echo "missing input out/m6_in/$s"; exit 1; }
+  MOUNTS+=(-v "$ROOT/out/m6_in/$s":/kaggle/input/$s:ro)
+done
+for s in casmi26-k30-features4-s0 casmi26-k30-features4-s1 casmi26-k30-features4-s2 casmi26-k30-features4-s3 casmi26-k35-eval7; do
+  [ -d "$ROOT/out/p3_in/$s" ] || { echo "missing input out/p3_in/$s"; exit 1; }
+  MOUNTS+=(-v "$ROOT/out/p3_in/$s":/kaggle/input/$s:ro)
+done
+docker run -d --name "$NAME" --gpus all --network none --memory 16g --memory-swap 16g --shm-size 8g \
+  -e KAGGLE_KERNEL_RUN_TYPE=Batch -e PYTHONUNBUFFERED=1 -e NUMBA_CACHE_DIR=/tmp/numba \
+  "${MOUNTS[@]}" -v "$py":/run.py:ro -v "$OUT":/kaggle/working "$IMG" \
+  bash -c "cd /kaggle/working && python /run.py > run.log 2>&1; rc=\$?; echo \"exit \$rc\" >> run.log; chown -R $U /kaggle/working; exit \$rc"
+echo "started $NAME -> $OUT/run.log"
