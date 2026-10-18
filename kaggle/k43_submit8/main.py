@@ -49,6 +49,8 @@ T0 = time.time()
 VARIANT = "both_fprich_g2_grp_gl|hybi:0.7:0.8:5+nogen"  # k42 の ext_submit を --define で入れる
 EXT_REF = "both_fprich_g2_grp|hybi:0.7:0.8:5+nogen"  # 採点する上位 K を決める参照の順（v12、k41 と同じ）
 EXT_WORKERS = 0  # GLACIER の DataLoader の worker（Kaggle の共有メモリが分からないので 0）
+EXT_MIN_RATE = 5.0  # 予測が 1 万件ごとにこれ（件/秒）を下回ったら止める（k41 の ICEBERG は Kaggle で 40 → 4 件/秒に落ちた、
+EXT_WINDOW = 10000  # 2026-10-17。12 時間の上限まで GPU の枠を使い切らないため。健全なら Kaggle で約 40 件/秒）
 REQUIRE_CUDA = True  # fwd / fprich / G2 は k30 と同じ GPU で（手元の動作確認は False）
 GRAPH_WORKERS = 4
 PC_MAX_CAND = 300  # S' の窓が大きいときは fz の上位だけを採点する（pcside、計画 2026-10-14）
@@ -135,7 +137,8 @@ idx = [NAMES.index(c) for c in cols]
 print(f"pool: {tag} {V['score']} ({len(cols)} columns) | generation: {GEN}")
 
 
-ext_stats = dict(molecules=0, with_specs=0, scored=0, entries=0)
+ext_stats = dict(molecules=0, with_specs=0, scored=0, entries=0, secs=0.0)
+ext_win = dict(entries=0, secs=0.0)
 
 
 def ext_cols(cand, X, XG, specs_ce):
@@ -149,9 +152,21 @@ def ext_cols(cand, X, XG, specs_ce):
     for k in EXT_KINDS:
         v = np.full(len(cand), np.nan)
         if specs_ce:
-            pc_ = {}
+            pc_, t0 = {}, time.time()
             v[pos.reindex(top).values.astype(np.int64)] = ext.score_candidates(EXTM[k], specs_ce, [P.smiles[p] for p in top], pc_)
+            dt = time.time() - t0
             ext_stats["entries"] += len(pc_)
+            ext_stats["secs"] += dt
+            ext_win["entries"] += len(pc_)
+            ext_win["secs"] += dt
+            if ext_win["entries"] >= EXT_WINDOW:
+                rate = ext_win["entries"] / max(ext_win["secs"], 1e-9)
+                print(f"  ext {ext_stats['entries']:,} entries, {rate:.0f} entries/s (last window), failed "
+                      f"{ {k_: m.n_fail for k_, m in EXTM.items()} }, errors { {k_: m.n_err for k_, m in EXTM.items()} }",
+                      flush=True)
+                if rate < EXT_MIN_RATE:
+                    raise RuntimeError(f"ext prediction slowed to {rate:.1f} entries/s (< {EXT_MIN_RATE}); stopping")
+                ext_win.update(entries=0, secs=0.0)
         ext_stats["scored"] += int(np.isfinite(v).sum())
         blocks.append(ext.columns(v, FTAB.fid[cand]))
     return np.column_stack(blocks)
