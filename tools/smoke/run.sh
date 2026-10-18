@@ -535,7 +535,7 @@ assert all(same) and n_pc.sum() > 0
       done
       TAIL=${TAIL:-6} run_kernel k42 "$py" "$D/k42" --memory 12g "${M[@]}" -v "$ROOT/out/m6_in/casmi26-k26-fp2":/kaggle/input/k26:ro \
         -v "$ROOT/out/m6_in/casmi26-k05-pool":/kaggle/input/k05:ro -v "$ROOT/out/ds_mspred_flat":/kaggle/input/casmi26-mspred:ro \
-        -v "$ROOT/out/p3_k41_gl_smoke":/kaggle/input/casmi26-p3-ext:ro ;;
+        -v "${P3EXT:-$ROOT/out/p3_k41_gl_smoke}":/kaggle/input/casmi26-p3-ext:ro ;;  # P3EXT=out/ds_p3ext: the full gl + ice columns
     *) echo "unknown step $step"; exit 1 ;;
   esac
 done
