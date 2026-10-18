@@ -270,6 +270,8 @@ for j, (gi, rows_, mem) in enumerate(todo):
         el = time.time() - T0
         print(f"  part {pc}: {n_done}/{len(todo)} groups, {n_entries:,} entries, {len(keys) / (time.time() - t_last):.0f}"
               f" entries/s, failed {M.n_fail}, {el / 3600:.2f} h", flush=True)
+        if M.n_err:
+            print("    errors", {f"{a}:{b}": n for (a, b), n in M.n_err.items()}, flush=True)
         chunk, need, t_last = [], {}, time.time()
 
 # %% [markdown]
@@ -293,7 +295,8 @@ rep = dg.groupby("set").agg(n=("qid", "size"), with_specs=("n_specs", lambda x: 
                             ext_mrr_in_top=("truth_ext_rank", lambda x: float(np.mean(1 / x))))
 print("report only (ext alone among the scored top", K_TOP, "):\n", rep.round(3).to_string())
 meta = dict(kind=KIND, sha=M.sha, ref=REF, k_top=K_TOP, reference_here=ref, k35_rule7=k35, truth_within_top=cover,
-            probe_top1=probe_top1, sets=res, entries=n_entries, failed=M.n_fail, workers=WORKERS, shard=SHARD,
+            probe_top1=probe_top1, sets=res, entries=n_entries, failed=M.n_fail,
+            errors={f"{a}:{b}": n for (a, b), n in M.n_err.items()}, workers=WORKERS, shard=SHARD,
             n_shards=N_SHARDS,
             secs=round(time.time() - T0), max_queries=MAX_QUERIES, src_sha=os.environ.get("CASMI26_SHA"),
             rdkit=rdkit.__version__)

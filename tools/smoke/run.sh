@@ -509,12 +509,13 @@ assert all(same) and n_pc.sum() > 0
       # M7 P3 ext.py: entropy similarity == the probe's, NaN convention of the columns, probe identity top-1 of GLACIER /
       # ICEBERG within 0.02, score_candidates; needs out/ds_mspred_flat (casmi26-mspred) and the GPU (GPU=1 not required)
       mkdir -p "$D/ext"
-      docker run --rm --network none --gpus all --memory 14g --shm-size 4g -v "$ROOT/src":/src:ro \
+      docker run --rm --name casmi26-smoke-ext-$(date +%m%d%H%M) --network none --gpus all --memory 14g --shm-size 4g \
+        -v "$ROOT/src":/src:ro \
         -v "$ROOT/out/ds_mspred_flat":/kaggle/input/casmi26-mspred:ro -v "$ROOT/out/ds_wheels":/wheels:ro -v "$D/ext":/w \
         -v "$ROOT/tools/smoke/check_ext.py":/c.py:ro -e NUMBA_CACHE_DIR=/tmp/numba -e EXT_WORKERS=${EXT_WORKERS:-0} "$IMG" \
         bash -c "pip install -q --no-index --find-links /wheels rdkit > /dev/null 2>&1; cd /w && python /c.py > /w/run.log 2>&1; \
         rc=\$?; chown -R $U /w; exit \$rc" || { tail -30 "$D/ext/run.log"; exit 1; }
-      grep -E "^\(|ALL OK|FAILED" "$D/ext/run.log" ;;
+      grep -E "^\(|ALL OK|FAILED|error #" "$D/ext/run.log" ;;
     k41)
       # M7 P3-1 on the REAL inputs (out/m6_in, out/p3_in, out/ds_mspred_flat), 20 queries per set, GLACIER, local GPU
       SMOKE=1 "$ROOT/tools/local/run_k41.sh" gl

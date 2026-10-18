@@ -267,6 +267,18 @@ class ExtModel:
             self.model.freeze()
         self.model = self.model.to(self.device)
         self.n_fail = 0
+        self.n_err = {}  # (where, exception type) -> count; batch errors fall back to one entry at a time
+
+    def _err(self, where, e):
+        """Count an exception, log the first 5 of each kind (exceptions were silent until 2026-10-18, when ICEBERG on
+        Kaggle slowed from 40 to 4 entries/s with 354 failures) and release cached CUDA memory."""
+        import torch
+        k = (where, type(e).__name__)
+        self.n_err[k] = self.n_err.get(k, 0) + 1
+        if self.n_err[k] <= 5:
+            self.log(f"  {self.kind} {where} error #{self.n_err[k]} {type(e).__name__}: {str(e)[:300]!r}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # ---------------------------------------------------------------- GLACIER
     def _gl_items(self, entries):
@@ -313,11 +325,13 @@ class ExtModel:
             idx = range(a, min(a + bs, n))
             try:
                 self._gl_forward([ds[i] for i in idx], out)
-            except Exception:
+            except Exception as e:
+                self._err("batch", e)
                 for i in idx:  # isolate the failing entry
                     try:
                         self._gl_forward([ds[i]], out)
-                    except Exception:
+                    except Exception as e1:
+                        self._err("entry", e1)
                         self.n_fail += 1
         return out
 
@@ -346,11 +360,13 @@ class ExtModel:
             try:
                 for i, r in zip(idx, self._ice_forward([entries[i] for i in idx])):
                     out[i] = r
-            except Exception:
+            except Exception as e:
+                self._err("batch", e)
                 for i in idx:
                     try:
                         out[i] = self._ice_forward([entries[i]])[0]
-                    except Exception:
+                    except Exception as e1:
+                        self._err("entry", e1)
                         self.n_fail += 1
         return out
 

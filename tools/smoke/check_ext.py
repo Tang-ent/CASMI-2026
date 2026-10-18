@@ -5,6 +5,8 @@
     (GLACIER 0.840, ICEBERG 0.780; max similarity over the three CEs, as the probe)
 (d) score_candidates on one probe structure against 5 others: its own score is the largest; a bad SMILES is NaN
 (e) timing per prediction entry (and GLACIER with DataLoader workers when EXT_WORKERS > 0)
+(f) error path (2026-10-18): _err counts and logs; a batch with a bad adduct falls back to single entries, keeps the
+    good entry's prediction and counts the bad one in n_fail / n_err
 Mounts /src (code), /kaggle/input/casmi26-mspred (out/ds_mspred), /wheels (rdkit), /w (scratch)."""
 import math
 import os
@@ -121,6 +123,16 @@ for kind in ext.KINDS:
     sc = ext.score_candidates(M, [spec], [lab.smiles[i]] + list(lab.smiles[1:6]) + ["C1CC1.[Na+]", "not_a_smiles"])
     print(f"(d) {kind}: scores {np.round(sc, 3)}")
     ok &= int(np.nanargmax(sc)) == 0 and np.isnan(sc[-1]) and np.isnan(sc[-2])
+    # (f)
+    M._err("test", RuntimeError("smoke"))
+    ok &= M.n_err.get(("test", "RuntimeError")) == 1
+    nf = M.n_fail
+    e0 = ents[0]
+    pr = M.predict([e0, (e0[0], "[M+Bogus]+", e0[2], e0[3], e0[4])])
+    print(f"(f) {kind}: good entry predicted {pr[0] is not None}, bad entry {pr[1] is not None}, "
+          f"n_fail +{M.n_fail - nf}, n_err {M.n_err}")
+    bad = M.n_fail - nf  # 0 if ms-pred accepts the adduct silently; then only the direct _err call is checked
+    ok &= pr[0] is not None and bad in (0, 1) and (bad == 0 or any(k[0] == "entry" for k in M.n_err))
     del M
     import torch  # noqa: E402
 

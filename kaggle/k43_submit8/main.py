@@ -242,8 +242,9 @@ for i, (mid, g) in enumerate(te.groupby("molecule_id", sort=False)):
         print(f"  {i + 1} molecules, {time.time() - T0:.0f}s", flush=True)
 print(stats)
 if EXT_KINDS:
-    stats.update({f"ext_{k}": v for k, v in ext_stats.items()}, ext_failed={k: m.n_fail for k, m in EXTM.items()})
-    print("ext:", ext_stats, "| failed", {k: m.n_fail for k, m in EXTM.items()})
+    stats.update({f"ext_{k}": v for k, v in ext_stats.items()}, ext_failed={k: m.n_fail for k, m in EXTM.items()},
+                 ext_errors={k: {f"{a}:{b}": n for (a, b), n in m.n_err.items()} for k, m in EXTM.items()})
+    print("ext:", ext_stats, "| failed", {k: m.n_fail for k, m in EXTM.items()}, "| errors", stats["ext_errors"])
 
 # %%
 def write(rows, path):

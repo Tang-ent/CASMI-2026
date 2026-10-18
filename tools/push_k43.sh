@@ -12,7 +12,12 @@ v=${1:?variant name}
 SLUG=yuanyuan98/casmi26-k43-submit8
 python3 tools/build_kernel.py k43_submit8 --define "VARIANT=\"$v\""
 grep -qF "$v" kaggle/k43_submit8/build/casmi26-k43-submit8.ipynb || { echo "variant not in the build"; exit 1; }
-kaggle kernels push -p kaggle/k43_submit8/build
+for i in $(seq 1 60); do  # retry: a GPU batch slot may still be held right after a cancel ("Maximum batch GPU session count")
+  r=$(kaggle kernels push -p kaggle/k43_submit8/build 2>&1 || true); echo "$r"
+  echo "$r" | grep -q "successfully pushed" && break
+  [ "$i" -eq 60 ] && { echo "push failed 60 times"; exit 1; }
+  sleep 120
+done
 sleep 60
 out/wait_kernel.sh "$SLUG"
 dest=out/m7_k43/$(date +%m%d%H%M)
