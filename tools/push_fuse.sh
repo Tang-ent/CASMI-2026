@@ -4,7 +4,7 @@
 # (tools/check_fuse.py). A commit run processes 12 molecules (the base notebook's SMOKE switch); the hidden-test rerun at
 # submission processes all of them. The submission itself is made by the user from the version page; then
 #   python tools/wandb_lb.py --group M8 --note "fuse v12 BETA 0.6 (fork v<N>)"
-#   tools/push_fuse.sh [--beta 0.6]
+#   tools/push_fuse.sh [--mode rescore | --mode engine --beta 0.6]
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
@@ -20,5 +20,5 @@ sleep 60
 out/wait_kernel.sh "$SLUG"
 dest=out/m8_fuse/$(date +%m%d%H%M)
 python3 tools/kaggle_out.py "$SLUG" -p "$dest" \
-  --files 'submission\.csv|submission_e004_control\.csv|.*verification\.json|experiment_audit.*|own/own_(stats|lists)\.json|own/own_submission\.csv|run_manifest\.json|e004_candidate_inputs\.json'
+  --files 'submission\.csv|submission_e004_control\.csv|.*verification\.json|experiment_audit.*|own/own_(stats|lists|rescore|candidates)\.json|own/own_submission\.csv|run_manifest\.json|e004_candidate_inputs\.json'
 python3 tools/check_fuse.py "$dest"

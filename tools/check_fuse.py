@@ -1,7 +1,8 @@
 """Checks of one fetched fusion-notebook version (M8, 2026-10-19; tools/push_fuse.sh).
   python tools/check_fuse.py out/m8_fuse/<MMDDHHMM> [base dir, default out/m8_fuse/base_v1]
-Hard checks: the run kept the base environment (E004_PREFLIGHT: Python 3.12, RDKit 2026.03.3, T4); our engine ran
-(own lists N, no OWN ENGINE FAILED, own_stats: every processed molecule, models on cuda, RDKit 2026.09.1); the E006 overlay
+Hard checks: the run kept the base environment (E004_PREFLIGHT: Python 3.12, RDKit 2026.03.3, T4); our part ran
+(v3 engine: own lists N, no OWN ENGINE FAILED, every processed molecule; v4 re-scorer: own rescore line, no OWN RESCORE
+FAILED, scores for every processed molecule when the gate is off on a commit; models on cuda, RDKit 2026.09.1); the E006 overlay
 finished (FACTORIAL_VERIFICATION, same-run control reconstructed); submission.csv has the sample's 400 ids, 1..25 entries,
 no repeated SMILES in a row.
 Report: our list lengths and window sizes, rows / top-1 changed against the base version's submission (same processed
@@ -26,21 +27,38 @@ def grab(tag):
 pre = grab("E004_PREFLIGHT")
 print("preflight", pre)
 ok &= bool(pre) and pre["python"].startswith("3.12") and pre["rdkit"] == "2026.03.3" and "T4" in pre["gpu"]
-m = re.search(r"^own lists (\d+) (\d+)s BETA ([0-9.]+)", txt, re.M)
-failed = "OWN ENGINE FAILED" in txt
-print("own lists", m.groups() if m else None, "| OWN ENGINE FAILED (do not submit this version)" if failed else "")
-ok &= bool(m) and not failed
-st = json.load(open(f"{d}/own/own_stats.json"))
-print("own stats", {k: st[k] for k in ("stats", "secs", "rdkit", "devices", "src_sha")})
+RESCORE = "own rescore" in txt or "OWN RESCORE FAILED" in txt  # v4 (re-scorer) or v3 (third engine)
 ver = json.load(open(f"{d}/experiment_verification.json"))
 processed = set(ver["processed_ids"])
-ok &= st["stats"]["molecules"] == len(processed) and st["rdkit"] == "2026.09.1" and all(x == "cuda" for x in st["devices"])
-# wiring: the fusion inputs saved by cell 31 carry our list for every processed molecule (the 12 visible-test molecules
-# of a commit are library hits, so "rows changed vs base" can be 0 without anything being wrong)
 inp = json.load(open(f"{d}/e004_candidate_inputs.json"))
-n_own = sum(bool((inp.get("own") or {}).get(mid) and inp["own"][mid].get("smiles")) for mid in processed)
-print(f"own lists in e004_candidate_inputs.json: {n_own}/{len(processed)}")
-ok &= n_own == len(processed)
+if RESCORE:
+    m = re.search(r"^own rescore (\d+) molecules (\d+) candidates (\d+)s LAM ([0-9.]+) GATE (\S+) gated_out (\d+)", txt, re.M)
+    failed = "OWN RESCORE FAILED" in txt
+    print("own rescore", m.groups() if m else None, "| OWN RESCORE FAILED (do not submit this version)" if failed else "")
+    ok &= bool(m) and not failed
+    st = json.load(open(f"{d}/own/own_rescore.json"))["stats"]
+    print("own stats", st)
+    ok &= st["rdkit"] == "2026.09.1" and all(x == "cuda" for x in st["devices"]) and st["unparsed"] <= 0.05 * max(st["candidates"], 1)
+    if m and m.group(5) == "inf":  # commit smoke: the gate is off, so every processed molecule must carry scores
+        sc = inp.get("own_rescore") or {}
+        n_sc = sum(bool((sc.get(mid) or {}).get("fzr")) for mid in processed)
+        print(f"own scores in e004_candidate_inputs.json: {n_sc}/{len(processed)}")
+        ok &= n_sc == len(processed) and st["molecules"] == len(processed)
+    name = f"rescore:fzr+g2:lam{m.group(4)}x2:gate0.9" if m else None
+else:
+    m = re.search(r"^own lists (\d+) (\d+)s BETA ([0-9.]+)", txt, re.M)
+    failed = "OWN ENGINE FAILED" in txt
+    print("own lists", m.groups() if m else None, "| OWN ENGINE FAILED (do not submit this version)" if failed else "")
+    ok &= bool(m) and not failed
+    st = json.load(open(f"{d}/own/own_stats.json"))
+    print("own stats", {k: st[k] for k in ("stats", "secs", "rdkit", "devices", "src_sha")})
+    ok &= st["stats"]["molecules"] == len(processed) and st["rdkit"] == "2026.09.1" and all(x == "cuda" for x in st["devices"])
+    # wiring: the fusion inputs saved by cell 31 carry our list for every processed molecule (the 12 visible-test
+    # molecules of a commit are library hits, so "rows changed vs base" can be 0 without anything being wrong)
+    n_own = sum(bool((inp.get("own") or {}).get(mid) and inp["own"][mid].get("smiles")) for mid in processed)
+    print(f"own lists in e004_candidate_inputs.json: {n_own}/{len(processed)}")
+    ok &= n_own == len(processed)
+    name = f"fuse:v12:beta{m.group(3)}" if m else None
 print("E006", {k: ver[k] for k in ("experiment", "window", "ice_fallback", "output_rows", "changed_rows", "changed_top1",
                                    "fallback_rows", "same_run_control_reconstructed")}, "| processed", len(processed))
 ok &= ver["same_run_control_reconstructed"] and ver["output_rows"] == 400 and "FACTORIAL_VERIFICATION" in txt
@@ -61,14 +79,16 @@ ch1 = sum(a[m][0] != b[m][0] for m in pm)
 print(f"vs base {base}: processed rows changed {ch}/{len(pm)}, top-1 changed {ch1}/{len(pm)}")
 aud = pd.read_csv(f"{d}/experiment_audit_factorial.csv")
 print("E006 branches", aud[aud.processed].branch.value_counts().to_dict())
-k36 = pd.read_csv("out/m7_k36/10160835/submission.csv", dtype=str).set_index("molecule_id").smiles
-mine = pd.read_csv(f"{d}/own/own_submission.csv", dtype=str).set_index("molecule_id").smiles
-same = sum(mine[m] == k36[m] for m in pm)
-print(f"own 25-entry list == k36 v12 submission on {same}/{len(pm)} processed molecules (GPU / torch may reorder near ties)")
+if not RESCORE:
+    k36 = pd.read_csv("out/m7_k36/10160835/submission.csv", dtype=str).set_index("molecule_id").smiles
+    mine = pd.read_csv(f"{d}/own/own_submission.csv", dtype=str).set_index("molecule_id").smiles
+    same = sum(mine[m_] == k36[m_] for m_ in pm)
+    print(f"own 25-entry list == k36 v12 submission on {same}/{len(pm)} processed molecules (GPU / torch may reorder near ties)")
 if ok:  # for tools/wandb_lb.py --variant-json (appends to tools/lb_points.csv)
-    json.dump(dict(variant=f"fuse:v12:beta{m.group(3)}", parsed=dict(base="yuanyuan98/enveda-casmi-2026 v1 (LB 0.441)",
-                   own="both_fprich_g2_grp|hybi:0.7:0.8:5+nogen", beta=float(m.group(3))), eval="fuse", local={},
-                   stats=st["stats"], src_sha=st["src_sha"], rdkit=st["rdkit"]), open(f"{d}/variant.json", "w"), indent=1)
-    print(f"wrote {d}/variant.json")
+    own = "fprich + G2 re-scorer, LAM 0.25 x 2, gate lib_max < 0.9 (rerun)" if RESCORE else "both_fprich_g2_grp|hybi:0.7:0.8:5+nogen"
+    json.dump(dict(variant=name, parsed=dict(base="yuanyuan98/enveda-casmi-2026 v1 (LB 0.441)", own=own), eval="fuse",
+                   local={}, stats=st if RESCORE else st["stats"], src_sha=st["src_sha"], rdkit=st["rdkit"]),
+              open(f"{d}/variant.json", "w"), indent=1)
+    print(f"wrote {d}/variant.json ({name})")
 print("OK" if ok else "FAILED (do not submit this version)")
 sys.exit(0 if ok else 1)
