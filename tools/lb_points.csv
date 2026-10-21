@@ -24,3 +24,4 @@ date,label,variant,submission_ref,lb_public,A,B_A,B_N,G_N,source,lb_at_submit
 2026-10-18,casmi26-k43-submit8 v359660959,both_fprich_g2_grp_ice.clean|hybm:0.8:5+nogen,57353023,0.33,0.9042747474747476,0.6436657331557332,0.6152056841468929,0.0,eval8 eval8 both_fprich_g2_grp_ice.clean|hybm:0.8:5+nogen,0.33
 2026-10-19,enveda-casmi-2026 v360084342,fuse:v12:beta0.6,57412268,0.417,,,,,fuse ,0.417
 2026-10-17,enveda-casmi-2026 v359272822,fuse:base,57301172,0.441,,,,,fuse ,0.441
+2026-10-20,enveda-casmi-2026 v360441472,rescore:fzr+g2:lam0.25x2:gate0.9,57455917,0.435,,,,,fuse ,0.435

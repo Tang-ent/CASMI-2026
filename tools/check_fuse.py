@@ -68,9 +68,10 @@ dup = int((parts.map(lambda x: len(set(x))) != parts.map(len)).sum())
 print(f"submission: rows {len(sub)}, ids {sub.molecule_id.nunique()}, entries {parts.map(len).min()}-{parts.map(len).max()}, "
       f"rows with repeated SMILES {dup}")
 ok &= len(sub) == 400 and sub.molecule_id.is_unique and parts.map(len).between(1, 25).all() and dup == 0
-own = json.load(open(f"{d}/own/own_lists.json"))
-lens = [len(own.get(mid, {}).get("smiles", [])) for mid in sorted(processed)]
-print("own list length per processed molecule", lens, "| window", [own.get(m, {}).get("n_window") for m in sorted(processed)])
+if not RESCORE:
+    own = json.load(open(f"{d}/own/own_lists.json"))
+    lens = [len(own.get(mid, {}).get("smiles", [])) for mid in sorted(processed)]
+    print("own list length per processed molecule", lens, "| window", [own.get(m, {}).get("n_window") for m in sorted(processed)])
 b = pd.read_csv(f"{base}/submission.csv", dtype=str, keep_default_na=False).set_index("molecule_id").smiles.str.split(";")
 a = parts.set_axis(sub.molecule_id)
 pm = sorted(processed & set(b.index))
