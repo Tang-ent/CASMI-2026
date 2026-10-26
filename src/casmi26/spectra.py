@@ -237,8 +237,11 @@ def clean_one(mz, it, prec):
     return m, i
 
 
-def merge_spectra(specs, tol=0.01):
-    """Collapse several (mz, it) spectra into one: each scaled to base peak 1, close peaks keep the larger."""
+def merge_spectra(specs, tol=0.01, how="max"):
+    """Collapse several (mz, it) spectra into one: each scaled to base peak 1, close peaks keep the larger.
+    how='sum': the same peaks are grouped (each run of peaks closer than tol to the larger one so far keeps that
+    peak's m/z), but the group's intensity is the sum of its members instead of the largest."""
+    assert how in ("max", "sum"), how
     specs = [(np.asarray(a, np.float64), np.asarray(b, np.float64)) for a, b in specs if len(a)]
     if not specs:
         return np.zeros(0, np.float32), np.zeros(0, np.float32)
@@ -248,16 +251,53 @@ def merge_spectra(specs, tol=0.01):
     mz, it = mz[o], it[o]
     keep = np.ones(len(mz), bool)
     last = 0
+    tot = it.copy() if how == "sum" else None  # running sum of the group, stored on its current representative
     for j in range(1, len(mz)):
         if mz[j] - mz[last] < tol:
             if it[j] > it[last]:
                 keep[last] = False
+                if tot is not None:
+                    tot[j] += tot[last]
                 last = j
             else:
                 keep[j] = False
+                if tot is not None:
+                    tot[last] += it[j]
         else:
             last = j
+    if tot is not None:
+        return mz[keep].astype(np.float32), tot[keep].astype(np.float32)
     return mz[keep].astype(np.float32), it[keep].astype(np.float32)
+
+
+def adduct_groups(specs, how="sum", tol=0.01, gap=None):
+    """Merge a query's spectra per adduct and polarity (consensus spectra, plan 9.2) -> list of dicts in order of
+    first appearance: mz, it (merge_spectra(..., how), base peak of each member = 1), prec = median of the members'
+    precursors, mode, adduct, n = number of members, idx = their indices in specs, ce = their collision energies
+    (NaN if absent).
+    gap: only spectra with a positive peak below prec - gap are members (the usable spectra of frag.py / g2.py with
+    gap = PREC_GAP); None = every spectrum with a peak. Groups without members are left out. The group key is
+    (adduct, mode): the library data has a few spectra whose polarity disagrees with the adduct name ([M+H]+ with
+    mode -1, [M-H]- with mode +1), and spectra of opposite polarity are never merged (as the analog channel)."""
+    out, key = [], {}
+    for i, s in enumerate(specs):
+        mz, it = np.asarray(s["mz"], np.float64), np.asarray(s["it"], np.float64)
+        k = it > 0 if gap is None else (mz < float(s["prec"]) - gap) & (it > 0)
+        if len(mz) == 0 or not k.any():
+            continue
+        a = (s["adduct"], s["mode"])
+        if a not in key:
+            key[a] = len(out)
+            out.append(dict(adduct=a[0], mode=a[1], idx=[]))
+        out[key[a]]["idx"].append(i)
+    for g in out:
+        mem = [specs[i] for i in g["idx"]]
+        g["mz"], g["it"] = merge_spectra([(s["mz"], s["it"]) for s in mem], tol, how)
+        g["prec"] = float(np.median([float(s["prec"]) for s in mem]))
+        g["n"] = len(mem)
+        g["ce"] = np.array([np.nan if s.get("ce") is None else float(s["ce"]) for s in mem], np.float64)
+        g["idx"] = np.array(g["idx"], np.int64)
+    return out
 
 
 def prep_query(mz, it, cfg=SimCfg):

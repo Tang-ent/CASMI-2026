@@ -33,6 +33,12 @@ FWD_FEATURES = ["fwd", "fwd_z", "fwd_rank"]  # 構造→スペクトルの予測
 # M6 P1（k30）: 豊かな指紋の FPNet（fprich、10,407 ビットの f.z）と G2（断片ごとの強度のコサイン）。渡したときだけ
 FPRICH_FEATURES = ["fzr", "fzr_z", "fzr_rank"]
 G2_FEATURES = ["g2", "g2_z", "g2_rank"]  # g2 は構造のグラフが無いと NaN（g2_z は 0、g2_rank は最下位）
+# 計画 9.2（2026-10-23）: スペクトルごとの統計（spec_stats）と、アダクトごとに統合したスペクトルの点数（consensus）。
+# Searcher(..., spec_stats=True / consensus=True) のときだけ、既存の列の後ろに FRAG_STATS、G2_STATS、CONS の順で足す
+# （frag と g2 の両方が要る）。min / std（母標準偏差、1 本なら 0）/ hice は spec_stats_of を参照。g2_* はグラフが無いと NaN
+FRAG_STATS = ["frag_expl_min", "frag_expl_std", "frag_expl_hice"]
+G2_STATS = ["g2_min", "g2_std", "g2_hice"]
+CONS = ["frag_expl_cons", "frag_expl_cons_z", "g2_cons", "g2_cons_z"]
 COL = {n: i for i, n in enumerate(FEATURES)}
 
 
@@ -79,12 +85,32 @@ def _zs_finite(x):
     return out
 
 
+def spec_stats_of(M, ce, mean):
+    """Per-spectrum statistics of plan 9.2 -> (min, std, hice) (n,) float32 from M (n_used, n) per-spectrum values,
+    ce (n_used,) their CE and mean (n,) the averaged column. std = population std (0 for one spectrum). hice = the
+    value of the spectrum with the largest finite CE (spectra sharing that CE averaged); no finite CE -> mean.
+    No usable spectrum -> min = hice = mean, std = 0 (NaN where mean is NaN). NaN columns of M (no structure graph)
+    stay NaN."""
+    mean = np.asarray(mean, np.float32)
+    M = np.asarray(M, np.float64)
+    if M.shape[0] == 0:
+        return mean.copy(), np.where(np.isfinite(mean), 0.0, np.nan).astype(np.float32), mean.copy()
+    ce = np.asarray(ce, np.float64)
+    f = np.isfinite(ce)
+    if f.any():
+        hice = M[f & (ce == ce[f].max())].mean(0).astype(np.float32)
+    else:
+        hice = mean.copy()
+    return M.min(0).astype(np.float32), M.std(0).astype(np.float32), hice
+
+
 def _unpack(fp_packed):
     return np.unpackbits(fp_packed, axis=1)[:, :chem.FP_BITS].astype(np.float32)
 
 
 class Searcher:
-    def __init__(self, cache, pool=None, cfg=None, sim=SimCfg, model=None, fwd=None, frag=None, fprich=None, g2=None):
+    def __init__(self, cache, pool=None, cfg=None, sim=SimCfg, model=None, fwd=None, frag=None, fprich=None, g2=None,
+                 spec_stats=False, consensus=False):
         self.C = cache
         self.model = model  # fpnet.FPModel or None
         # M5 P1: fwd = fwd.FwdModel、frag = frag.FragTable。渡したときだけ FEATURES の後ろに列を足す（渡さなければ今までと同じ）
@@ -94,6 +120,12 @@ class Searcher:
         self.feature_names = FEATURES + (FRAG_FEATURES if frag is not None else []) + \
             (FWD_FEATURES if fwd is not None else []) + (FPRICH_FEATURES if fprich is not None else []) + \
             (G2_FEATURES if g2 is not None else [])
+        # 計画 9.2: spec_stats / consensus（既定は無し。どちらも frag と g2 の両方が要る）
+        if (spec_stats or consensus) and (frag is None or g2 is None):
+            raise ValueError("spec_stats / consensus need both frag and g2")
+        self.spec_stats, self.consensus = bool(spec_stats), bool(consensus)
+        self.feature_names = self.feature_names + (FRAG_STATS + G2_STATS if spec_stats else []) + \
+            (CONS if consensus else [])
         self.P = pool if pool is not None else Pool(cache=cache)
         self.cfg = cfg or SearchCfg()
         self.sim = sim
@@ -283,10 +315,15 @@ class Searcher:
         X[:, COL["n_pos"]] = sum(1 for s in specs if s["mode"] > 0)
         X[:, COL["n_neg"]] = sum(1 for s in specs if s["mode"] < 0)
         X[:, COL["target_mass"]] = target / 1000.0
-        extra = []
+        extra, more = [], []  # more: the plan 9.2 columns, after all the existing ones
         if self.frag is not None:
-            from .frag import match_features
-            expl, top10 = match_features(specs, *self.frag.csr(cand))
+            from .frag import consensus_expl, match_features
+            fcsr = self.frag.csr(cand)
+            if self.spec_stats:
+                expl, top10, E, used = match_features(specs, *fcsr, per_spec=True)
+                more.append(np.column_stack(spec_stats_of(E, [specs[i].get("ce", np.nan) for i in used], expl)))
+            else:
+                expl, top10 = match_features(specs, *fcsr)
             extra.append(np.c_[expl, top10, _zs(expl), rank_norm(expl)])
         if self.fwd is not None:
             fw = self.fwd.score(specs, P.fp[cand])
@@ -298,8 +335,17 @@ class Searcher:
             fr = np.unpackbits(fp2[cand], axis=1)[:, :len(zr)].astype(np.float32) @ zr
             extra.append(np.c_[fr / 100.0, _zs(fr), rank_norm(fr)])
         if self.g2 is not None:
-            g = self.g2.score(specs, cand)
+            if self.spec_stats:
+                g, GM, gce, _ = self.g2.score(specs, cand, per_spec=True)
+                more.append(np.column_stack(spec_stats_of(GM, gce, g)))
+            else:
+                g = self.g2.score(specs, cand)
             extra.append(np.c_[g, _zs_finite(g), rank_norm(np.nan_to_num(g, nan=-1.0))])
+        if self.consensus:
+            fc = consensus_expl(specs, *fcsr)
+            gc = self.g2.score_consensus(specs, cand)
+            more.append(np.c_[fc, _zs(fc), gc, _zs_finite(gc)])
+        extra += more
         if extra:
             X = np.hstack([X] + extra).astype(np.float32)
         info = dict(target=target, n_cand=nc, ppm=ppm, lib_max=gmax, top_sim=top_sim, secs=time.time() - t0)

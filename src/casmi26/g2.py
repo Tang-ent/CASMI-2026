@@ -15,7 +15,11 @@ Cosine with a spectrum: observed = the top TOP_PEAKS peaks below precursor - 1.5
 Predicted ion m/z = fragment mass + shift * H +- proton (sign by polarity; like frag.py, Na / K fragment ions are not
 generated). Predictions with the same m/z (1e-4 Da) form one group; each group goes to the nearest observed peak within
 max(PPM, ABS_DA) and predictions on the same observed peak add up; unmatched groups stay in the norm.
-Score of a candidate for a query = mean cosine over the query's usable spectra.
+Score of a candidate for a query = mean cosine over the query's usable spectra (score(..., per_spec=True) also returns
+the cosine of each usable spectrum and its CE). Consensus score (score_consensus, plan 9.2): the query's spectra are
+merged per adduct (spectra.adduct_groups, how='sum'); the model predicts at each member spectrum's CE, the predicted
+group intensities of the members add up, and the sum is compared once to the merged observation; the adducts' cosines
+are averaged with the number of member spectra as weights.
 
 Training (fwd.train_rank form): (1 - cosine of the truth) + an in-window softmax over the truth and k_neg train
 structures with the truth's formula (enc3.SameFormulaNegatives), temperature temp. The training state is saved
@@ -426,15 +430,28 @@ def build_model(cfg=Cfg):
 def cosine(logits, valid, u, jou, obs, ex):
     """logits (S, F, NS), valid (S, F), u (S, F, NS) groups, jou (S, U) observed peak of each group (-1 none),
     obs (B, J) L2-normalised observed weights, ex (S,) row of obs for each structure -> (S,) cosine (0 without
-    fragments, finite gradients)."""
+    fragments, finite gradients). = group_cosine(group_intensities(...), ...)."""
+    return group_cosine(group_intensities(logits, valid, u, jou.shape[1]), jou, obs, ex)
+
+
+def group_intensities(logits, valid, u, U):
+    """logits (S, F, NS), valid (S, F), u (S, F, NS) groups -> (S, U) predicted intensity of each group (softmax over
+    the valid (fragment, shift) of a structure, summed per group; sums to 1, or 0 without fragments)."""
     import torch
-    S, J = logits.shape[0], obs.shape[1]
+    S = logits.shape[0]
     vm = valid[..., None].expand(-1, -1, NS).reshape(S, -1)
     lg = logits.float().reshape(S, -1).masked_fill(~vm, -1e4)
     p = torch.softmax(lg, -1) * vm
-    pu = p.new_zeros(S, jou.shape[1]).scatter_add_(1, u.reshape(S, -1).clamp(min=0).long(), p)
+    return p.new_zeros(S, U).scatter_add_(1, u.reshape(S, -1).clamp(min=0).long(), p)
+
+
+def group_cosine(pu, jou, obs, ex):
+    """pu (S, U) predicted group intensities, jou (S, U) observed peak of each group (-1 none), obs (B, J), ex (S,)
+    -> (S,) cosine: groups on the same observed peak add up, unmatched groups stay in the norm."""
+    import torch
+    S, J = pu.shape[0], obs.shape[1]
     jj = torch.where(jou >= 0, jou, J).long()
-    pj = p.new_zeros(S, J + 1).scatter_add_(1, jj, pu)[:, :J]
+    pj = pu.new_zeros(S, J + 1).scatter_add_(1, jj, pu)[:, :J]
     sq = (pj ** 2).sum(1) + (pu ** 2 * (jou < 0)).sum(1)
     return (pj * obs[ex]).sum(1) / torch.sqrt(sq + 1e-12)
 
@@ -448,7 +465,8 @@ def to_torch(b, dev):
 class G2Model:
     """score(specs, pids) -> (n,) mean cosine over the usable query spectra (NaN for structures without a graph).
     Inference is fp32 unless amp=True, so that GPU and CPU give the same features (as fwd; the k29 gate was scored
-    with amp). score_smiles scores structures given as SMILES (generated products)."""
+    with amp). score_smiles scores structures given as SMILES (generated products). score(..., per_spec=True) also
+    gives the cosine of every usable spectrum; score_consensus the consensus cosine of plan 9.2."""
 
     def __init__(self, path=None, G=None, net=None, cfg=None, device=None, amp=False):
         import torch
@@ -465,21 +483,28 @@ class G2Model:
             self.cfg, self.step = cfg or Cfg, -1
         self.net = net.eval()
 
-    def score(self, specs, pids, chunk=256):
+    def score(self, specs, pids, chunk=256, per_spec=False):
+        """-> (n,) mean cosine. per_spec=True: (mean, M (n_used, n) float32 cosine of each usable spectrum (NaN for
+        structures without a graph), ce (n_used,) its CE (NaN if absent), used (n_used,) its index in specs); the
+        mean is the same value as with per_spec=False."""
         import torch
         n = len(pids)
-        qs = []
-        for s in specs:
+        qs, ces, used = [], [], []
+        for i, s in enumerate(specs):
             om, ow = observed(s["mz"], s["it"], s["prec"])
             if len(om):
                 qs.append((om, ow, ion_of(s["mode"]), cond_row(adduct_index(s["adduct"]), s["mode"], s.get("ce", np.nan))))
+                ces.append(np.nan if s.get("ce") is None else float(s["ce"]))  # None = absent (as cond_row)
+                used.append(i)
         out = np.full(n, np.nan, np.float32)
+        M = np.full((len(qs), n), np.nan, np.float32) if per_spec else None
+        extra = (M, np.array(ces, np.float64), np.array(used, np.int64))
         if n == 0:
-            return out
+            return (out,) + extra if per_spec else out
         has = np.array([bool(self.G.ok[p]) for p in pids])
         out[has] = 0.0
         if not qs:
-            return out
+            return (out,) + extra if per_spec else out
         dev = self.device
         amp = self.amp and dev == "cuda"
         with torch.no_grad():
@@ -490,7 +515,8 @@ class G2Model:
                 with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
                     pre = self.net.encode(bt)
                 acc = np.zeros(len(ps))
-                for om, ow, ion, cond in qs:
+                hs = has[a:a + chunk]
+                for k, (om, ow, ion, cond) in enumerate(qs):
                     jou = jou_array([match(p["umz"], ion, om) if p else None for p in ps])
                     c = torch.as_tensor(cond, device=dev).expand(len(ps), -1)
                     with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
@@ -498,9 +524,64 @@ class G2Model:
                     obs = torch.as_tensor(np.pad(ow, (0, TOP_PEAKS - len(ow)))[None], device=dev)
                     cos = cosine(lg, bt["valid"], bt["u"], torch.as_tensor(jou, device=dev), obs,
                                  torch.zeros(len(ps), dtype=torch.long, device=dev))
-                    acc += cos.float().cpu().numpy()
+                    cn = cos.float().cpu().numpy()
+                    acc += cn
+                    if per_spec:
+                        M[k, a:a + chunk][hs] = cn[hs]
                 sl = out[a:a + chunk]
-                sl[has[a:a + chunk]] = (acc / len(qs))[has[a:a + chunk]]
+                sl[hs] = (acc / len(qs))[hs]
+        return (out,) + extra if per_spec else out
+
+    def score_consensus(self, specs, pids, chunk=256):
+        """-> (n,) consensus cosine (plan 9.2; NaN for structures without a graph, 0 when no spectrum is usable).
+        Spectra are merged per adduct (spectra.adduct_groups with how='sum' over the usable spectra, prec = the
+        members' median); for each adduct the model predicts at every member's CE (its own cond_row), the predicted
+        group intensities (group_intensities) add up over the members, and group_cosine compares the sum once to
+        observed() of the merged spectrum. The query's score = mean over adducts weighted by their member count."""
+        import torch
+        from .spectra import adduct_groups
+        n = len(pids)
+        out = np.full(n, np.nan, np.float32)
+        if n == 0:
+            return out
+        has = np.array([bool(self.G.ok[p]) for p in pids])
+        out[has] = 0.0
+        grp = []
+        for g in adduct_groups(specs, how="sum", gap=PREC_GAP):
+            om, ow = observed(g["mz"], g["it"], g["prec"])
+            if not len(om):
+                continue
+            ai = adduct_index(g["adduct"])
+            conds = [cond_row(ai, g["mode"], ce) for ce in g["ce"]]
+            grp.append((om, ow, ion_of(g["mode"]), conds, float(g["n"])))
+        if not grp:
+            return out
+        wsum = sum(x[4] for x in grp)
+        dev = self.device
+        amp = self.amp and dev == "cuda"
+        with torch.no_grad():
+            for a in range(0, n, chunk):
+                ps = [piece(self.G, p) for p in pids[a:a + chunk]]
+                b = collate(ps)
+                bt = to_torch(b, dev)
+                with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+                    pre = self.net.encode(bt)
+                acc = np.zeros(len(ps))
+                for om, ow, ion, conds, w in grp:
+                    jou = torch.as_tensor(jou_array([match(p["umz"], ion, om) if p else None for p in ps]), device=dev)
+                    pu = None
+                    for cond in conds:
+                        c = torch.as_tensor(cond, device=dev).expand(len(ps), -1)
+                        with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
+                            lg = self.net.head(pre, c)
+                        x = group_intensities(lg, bt["valid"], bt["u"], jou.shape[1])
+                        pu = x if pu is None else pu + x
+                    obs = torch.as_tensor(np.pad(ow, (0, TOP_PEAKS - len(ow)))[None], device=dev)
+                    cos = group_cosine(pu, jou, obs, torch.zeros(len(ps), dtype=torch.long, device=dev))
+                    acc += w * cos.float().cpu().numpy()
+                sl = out[a:a + chunk]
+                hs = has[a:a + chunk]
+                sl[hs] = (acc / wsum)[hs]
         return out
 
     def score_smiles(self, specs, smiles, chunk=256):

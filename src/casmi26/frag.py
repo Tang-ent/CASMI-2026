@@ -11,6 +11,10 @@ Match: for each query spectrum, the top 30 peaks by intensity below precursor - 
 peak m/z - (k * H +- proton) is within max(0.01 Da, 20 ppm) of a fragment (k = -2..2, proton sign by polarity).
 frag_expl = explained sqrt-intensity share, frag_top10 = explained share of the top-10 peaks (both averaged over
 spectra). Fragment ions are matched as protonated / deprotonated only (Na / K fragment ions do not match).
+match_features(..., per_spec=True) also returns each used spectrum's explained share (n_used, n_cand) and its index in
+specs (for the per-spectrum statistics of search.FRAG_STATS; the averaged columns stay the same values).
+consensus_expl (plan 9.2): frag_expl of the spectra merged per adduct (spectra.adduct_groups, how='sum'), averaged
+over the adducts with the number of member spectra as weights.
 """
 import numpy as np
 from numba import njit
@@ -176,11 +180,14 @@ def _match(off, ms, lo, hi):
     return out
 
 
-def match_features(specs, off, ms, sim=SimCfg):
-    """(frag_expl, frag_top10) per candidate of a local CSR, averaged over the usable query spectra."""
+def match_features(specs, off, ms, sim=SimCfg, per_spec=False):
+    """(frag_expl, frag_top10) per candidate of a local CSR, averaged over the usable query spectra.
+    per_spec=True: (frag_expl, frag_top10, E (n_used, n_cand) float32 explained share of each used spectrum, used
+    (n_used,) int64 index of that spectrum in specs); the first two are the same values as with per_spec=False."""
     nc = len(off) - 1
     expl, top10, n = np.zeros(nc), np.zeros(nc), 0
-    for s in specs:
+    rows, used = [], []
+    for i, s in enumerate(specs):
         mz, it = np.asarray(s["mz"], np.float64), np.asarray(s["it"], np.float64)
         k = mz < float(s["prec"]) - PREC_GAP
         mz, it = mz[k], it[k]
@@ -194,10 +201,32 @@ def match_features(specs, off, ms, sim=SimCfg):
         need = mz[:, None] - (H_SHIFTS[None, :] * H + ion)
         tol = np.maximum(sim.tol_da, mz * sim.tol_ppm * 1e-6)[:, None]
         hit = _match(off, ms, need - tol, need + tol)
-        expl += (hit * w[None, :]).sum(1) / w.sum()
+        e = (hit * w[None, :]).sum(1) / w.sum()
+        expl += e
         top10 += hit[:, :10].mean(1)
         n += 1
+        if per_spec:
+            rows.append(e.astype(np.float32))
+            used.append(i)
     if n:
         expl /= n
         top10 /= n
+    if per_spec:
+        E = np.stack(rows) if rows else np.zeros((0, nc), np.float32)
+        return expl.astype(np.float32), top10.astype(np.float32), E, np.array(used, np.int64)
     return expl.astype(np.float32), top10.astype(np.float32)
+
+
+def consensus_expl(specs, off, ms, sim=SimCfg):
+    """(n_cand,) float32 consensus frag_expl: the usable spectra merged per adduct (spectra.adduct_groups with
+    how='sum', prec = the members' median) -> match_features of each merged spectrum -> mean over the adducts weighted
+    by their member count (0 when no merged spectrum is usable, as match_features)."""
+    from .spectra import adduct_groups
+    nc = len(off) - 1
+    acc, wsum = np.zeros(nc), 0.0
+    for g in adduct_groups(specs, how="sum", gap=PREC_GAP):
+        e, _, _, used = match_features([g], off, ms, sim, per_spec=True)
+        if len(used):
+            acc += g["n"] * e.astype(np.float64)
+            wsum += g["n"]
+    return (acc / wsum if wsum else acc).astype(np.float32)
