@@ -44,7 +44,10 @@ if RESCORE:
         n_sc = sum(bool((sc.get(mid) or {}).get("fzr")) for mid in processed)
         print(f"own scores in e004_candidate_inputs.json: {n_sc}/{len(processed)}")
         ok &= n_sc == len(processed) and st["molecules"] == len(processed)
-    name = f"rescore:fzr+g2:lam{m.group(4)}x2:gate0.9" if m else None
+    w = re.search(r"^own rescore .* WHERE (\w+)", txt, re.M)
+    where = w.group(1) if w else "all"  # v4 printed no WHERE (= all)
+    print("where", where)
+    name = (f"rescore:fzr+g2:lam{m.group(4)}x2:gate0.9" + ("" if where == "all" else f":{where}")) if m else None
 else:
     m = re.search(r"^own lists (\d+) (\d+)s BETA ([0-9.]+)", txt, re.M)
     failed = "OWN ENGINE FAILED" in txt
@@ -86,7 +89,7 @@ if not RESCORE:
     same = sum(mine[m_] == k36[m_] for m_ in pm)
     print(f"own 25-entry list == k36 v12 submission on {same}/{len(pm)} processed molecules (GPU / torch may reorder near ties)")
 if ok:  # for tools/wandb_lb.py --variant-json (appends to tools/lb_points.csv)
-    own = "fprich + G2 re-scorer, LAM 0.25 x 2, gate lib_max < 0.9 (rerun)" if RESCORE else "both_fprich_g2_grp|hybi:0.7:0.8:5+nogen"
+    own = f"fprich + G2 re-scorer ({where}), LAM 0.25 x 2, gate lib_max < 0.9 (rerun)" if RESCORE else "both_fprich_g2_grp|hybi:0.7:0.8:5+nogen"
     json.dump(dict(variant=name, parsed=dict(base="yuanyuan98/enveda-casmi-2026 v1 (LB 0.441)", own=own), eval="fuse",
                    local={}, stats=st if RESCORE else st["stats"], src_sha=st["src_sha"], rdkit=st["rdkit"]),
               open(f"{d}/variant.json", "w"), indent=1)
