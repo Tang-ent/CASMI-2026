@@ -276,21 +276,26 @@ def window_ranks(Z, P, pids, ppm=10.0, fp=None, keep=None):
 TAN_BINS = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 1.01)
 
 
-def provenance_coef(Z, P, pids, holdout, ppm=10.0, n_boot=2000, seed=2):
+def provenance_coef(Z, P, pids, holdout, ppm=10.0, n_boot=2000, seed=2, score_fn=None):
     """Does the model score structures that only appear as negatives (COCONUT-only) lower than comparable
     never-trained structures (holdout train structures)? For every query window (candidates within +-ppm of the
     truth's mass, truth excluded) the scores f.z are standardised; the result is the weighted mean over bins of the
     Tanimoto similarity to the truth of mean(z | COCONUT-only) - mean(z | holdout), weights = holdout counts per bin,
-    with a bootstrap over queries. -> dict(est, se, lo, hi, n_co, n_ho) (k14 section 3; used by k15 for v2b)."""
+    with a bootstrap over queries. -> dict(est, se, lo, hi, n_co, n_ho) (k14 section 3; used by k15 for v2b).
+    score_fn (plan 10.3, MSAlign gate S): score_fn(i, cand) -> scores of the window candidates of query i, used in
+    place of f.Z[i] (Z is then ignored and may be None). Bins, standardisation and bootstrap are unchanged."""
     from .harness import boot_index, ci
     pop = np.unpackbits(np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(1)
     hold = np.asarray(sorted(holdout), np.int64)
     nb = len(TAN_BINS) - 1
     S, N = np.zeros((len(pids), 2, nb)), np.zeros((len(pids), 2, nb))
-    for i, (z, p) in enumerate(zip(Z, pids)):
+    for i, (z, p) in enumerate(zip(Z, pids) if score_fn is None else ((None, p) for p in pids)):
         c = P.window(P.mass[p], ppm)
         F = P.fp[c]
-        s = np.unpackbits(F, axis=1)[:, :len(z)].astype(np.float32) @ z
+        if score_fn is None:
+            s = np.unpackbits(F, axis=1)[:, :len(z)].astype(np.float32) @ z
+        else:
+            s = np.asarray(score_fn(i, c))
         if len(s) < 3 or s.std() == 0:
             continue
         zz = (s - s.mean()) / s.std()
